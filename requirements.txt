@@ -1,7 +1,9 @@
---extra-index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://download.pytorch.org/whl/cu126
 
 pandas
-torch
+torch==2.7.0
+torchvision==0.22.0
+torchaudio==2.7.0
 numpy
 scikit-learn
 transformers
@@ -13,8 +15,7 @@ seaborn
 sentencepiece
 protobuf==3.20.3
 tensorboard
-matplotlib
 mediapipe
-# Optional Mamba backend:
-# install it in a separate CUDA-enabled env following docs/MambaInstall.md
-# or use requirements-mamba.txt for the pinned torch 2.7.0 / triton 3.3.0 stack
+# Cloud/GPU note:
+# This file now targets a CUDA-enabled PyTorch wheel for cloud Linux environments.
+# If you need the optional Mamba backend, use requirements-mamba.txt instead.

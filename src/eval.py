@@ -22,10 +22,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--clips_dir', default='data/ubfc_clips')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose (DEBUG) logging')
-    parser.add_argument('--dataset', type=str, default='ubfc', choices=['ubfc', 'bh_rppg'],
-                        help='Which dataset format to evaluate (affects output dir naming)')
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--frame_depth', type=int, default=64,
+                        help='Temporal clip length expected by TSM front-end (should match preprocessing clip_len)')
     parser.add_argument('--max_samples', type=int, default=0,
                         help='If >0, limit number of clips evaluated (useful for smoke tests)')
     parser.add_argument('--examples', type=int, default=5,
@@ -50,7 +50,7 @@ def main():
         logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(name)s: %(message)s')
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    ds = UBFCClipDataset(args.clips_dir)
+    ds = UBFCClipDataset(args.clips_dir, frame_depth=args.frame_depth)
 
     # Subject-aware selection (mirror train.py behavior)
     def subject_from_name(fn: Path) -> str:
@@ -82,7 +82,7 @@ def main():
 
     ds.files = filtered_files
 
-    model = EfficientPhysMambaRegressor(in_channels=6)
+    model = EfficientPhysMambaRegressor(in_channels=6, frame_depth=args.frame_depth)
     ckpt = torch.load(args.checkpoint, map_location='cpu')
     model.load_state_dict(ckpt['model_state'])
     model.to(device)
@@ -131,15 +131,6 @@ def main():
             return file_name.split('_clip_', 1)[0]
         return Path(file_name).stem
 
-    # Preload optional fps metadata (if saved during preprocessing)
-    fps_list = []
-    for fn in ds.files:
-        try:
-            hdr = torch.load(fn, weights_only=False)  # clip: (T,6,H,W), hr: float
-            fps_list.append(float(hdr.get('fps', args.fps)))
-        except Exception:
-            fps_list.append(float(args.fps))
-
     preds = []
     fft_preds = []
     hrs = []
@@ -160,8 +151,10 @@ def main():
             batch_hrs = []
             batch_fps = []
             batch_roi_types = []
+            batch_payloads = []
             for fn in batch_files:
                 data = torch.load(fn, weights_only=False)  # clip: (T,6,H,W), hr: float
+                batch_payloads.append(data)
                 clips.append(data['clip'].float())
                 batch_hrs.append(float(data.get('hr', 0.0)))
                 batch_fps.append(float(data.get('fps', args.fps)))
@@ -203,6 +196,7 @@ def main():
             # collect
             for j, fn in enumerate(batch_files):
                 subject_name = extract_subject_name(fn.name)
+                payload = batch_payloads[j]
                 preds.append(float(pooled_out[j]))
                 hrs.append(float(batch_hrs[j]))
                 fns.append(fn.name)
@@ -215,7 +209,7 @@ def main():
                     'file': fn.name,
                     'subject': subject_name,
                     'signal': np.asarray(sig).copy(),
-                    'true_ppg': np.asarray(data.get('ppg')).copy() if data.get('ppg') is not None else None,
+                    'true_ppg': np.asarray(payload.get('ppg')).copy() if payload.get('ppg') is not None else None,
                     'fps': fps_val,
                     'pred_hr': float(pooled_out[j]),
                     'fft_hr': float(fft_hr) if not np.isnan(fft_hr) else float('nan'),
@@ -233,13 +227,19 @@ def main():
     mae_fft = float(np.nanmean(np.abs(fft_preds - hrs)))
     bias = float(np.nanmean(preds - hrs))
     bias_std = float(np.nanstd(preds - hrs))
+    pred_std = float(np.nanstd(preds))
+    pred_min = float(np.nanmin(preds)) if preds.size > 0 else float('nan')
+    pred_max = float(np.nanmax(preds)) if preds.size > 0 else float('nan')
     logger.info('Model MAE: %.3f bpm, FFT MAE: %.3f bpm', mae, mae_fft)
+    logger.info('Prediction spread: pred_std=%.6f, pred_min=%.3f, pred_max=%.3f, bias=%.3f±%.3f', pred_std, pred_min, pred_max, bias, bias_std)
+    if pred_std < 1e-3:
+        logger.warning('Predictions are nearly constant (pred_std=%.6f). This indicates potential mean-collapse.', pred_std)
 
     # Save CSV and plots
-    out_dir = Path('eval_outputs') / args.dataset
+    out_dir = Path('eval_outputs') / 'ubfc'
     out_dir.mkdir(parents=True, exist_ok=True)
     import csv
-    csv_path = out_dir / f'predictions_{args.dataset}.csv'
+    csv_path = out_dir / 'predictions_ubfc.csv'
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['file', 'pred_hr', 'fft_hr', 'true_hr'])
@@ -247,7 +247,7 @@ def main():
             writer.writerow([fn, p, fhr, t])
 
     # Save a simple subject-level summary CSV as well
-    summary_csv = out_dir / f'subject_summary_{args.dataset}.csv'
+    summary_csv = out_dir / 'subject_summary_ubfc.csv'
     from collections import defaultdict
     subj_stats = defaultdict(list)
     for file_name, pred, true in zip(fns, preds.tolist(), hrs.tolist()):

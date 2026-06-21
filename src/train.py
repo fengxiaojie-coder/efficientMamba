@@ -34,12 +34,151 @@ except Exception:
 import csv
 
 
-def train_epoch(model, loader, optimizer, loss_fn, device, desc: str | None = None):
+def _neg_pearson_loss(preds: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Return 1-r where r is Pearson correlation over the current batch."""
+    x = preds.view(-1)
+    y = target.view(-1)
+    x = x - torch.mean(x)
+    y = y - torch.mean(y)
+    denom = torch.sqrt(torch.sum(x * x) * torch.sum(y * y) + eps)
+    if torch.isfinite(denom) and float(denom.item()) > eps:
+        r = torch.sum(x * y) / denom
+        return 1.0 - r
+    return preds.new_tensor(0.0)
+
+
+def _build_roi_map(clips, roi_types, device):
+    """Build centered Gaussian ROI bias map for non-full ROI samples."""
+    if roi_types is None:
+        return None
+    try:
+        B = clips.size(0)
+        H = clips.size(-2)
+        W = clips.size(-1)
+        mask = torch.ones((B, 1, H, W), device=device)
+        ys = torch.linspace(-1, 1, H, device=device).unsqueeze(1).expand(H, W)
+        xs = torch.linspace(-1, 1, W, device=device).unsqueeze(0).expand(H, W)
+        dist2 = xs ** 2 + ys ** 2
+        g = torch.exp(-dist2 / (0.5 ** 2))
+        for i, rt in enumerate(roi_types):
+            if isinstance(rt, bytes):
+                rt = rt.decode()
+            if rt is None or rt == 'full':
+                mask[i, 0] = 1.0
+            else:
+                mask[i, 0] = g
+        return mask
+    except Exception:
+        return None
+
+
+def _compute_grad_norm(model: nn.Module) -> float:
+    total = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            g = p.grad.detach()
+            total += float(torch.sum(g * g).item())
+    return total ** 0.5
+
+
+def _save_step_debug_visual(
+    save_dir: Path,
+    epoch: int,
+    step: int,
+    clips: torch.Tensor,
+    preds: torch.Tensor,
+    hrs: torch.Tensor,
+    loss_value: float,
+    grad_norm: float,
+    attn_dict: dict | None,
+):
+    """Save per-step debug panel and numeric diagnostics for quick failure checks."""
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import torch.nn.functional as F
+
+        debug_dir = save_dir / 'debug_steps'
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        c = clips[0].detach().cpu()  # [T,6,H,W]
+        t_mid = c.shape[0] // 2
+        raw = c[t_mid, 3:6].permute(1, 2, 0).numpy()
+        raw = np.clip(raw, 0.0, 1.0)
+        diff = c[t_mid, :3].permute(1, 2, 0).numpy()
+        diff_mag = np.linalg.norm(diff, axis=-1)
+
+        fig, axes = plt.subplots(1, 4, figsize=(14, 3.5))
+        axes[0].imshow(raw)
+        axes[0].set_title('raw RGB (mid frame)')
+        axes[0].axis('off')
+
+        im1 = axes[1].imshow(diff_mag, cmap='magma')
+        axes[1].set_title('diff magnitude')
+        axes[1].axis('off')
+        plt.colorbar(im1, ax=axes[1], fraction=0.046)
+
+        if attn_dict is not None:
+            g1 = attn_dict['g1'][0, t_mid, 0].detach().cpu().numpy()
+            g2_t = min(t_mid, attn_dict['g2'].shape[1] - 1)
+            g2 = attn_dict['g2'][0, g2_t, 0].detach().cpu().unsqueeze(0).unsqueeze(0)
+            g2_up = F.interpolate(g2, size=(g1.shape[0], g1.shape[1]), mode='bilinear', align_corners=False)
+            g2_up = g2_up.squeeze().numpy()
+
+            im2 = axes[2].imshow(g1, cmap='hot')
+            axes[2].set_title('G1 attention')
+            axes[2].axis('off')
+            plt.colorbar(im2, ax=axes[2], fraction=0.046)
+
+            im3 = axes[3].imshow(g2_up, cmap='hot')
+            axes[3].set_title('G2 attention (upsampled)')
+            axes[3].axis('off')
+            plt.colorbar(im3, ax=axes[3], fraction=0.046)
+        else:
+            axes[2].axis('off')
+            axes[2].set_title('G1 attention (N/A)')
+            axes[3].axis('off')
+            axes[3].set_title('G2 attention (N/A)')
+
+        pred_val = float(preds[0].item())
+        true_val = float(hrs[0].item())
+        fig.suptitle(
+            f'E{epoch} S{step} | loss={loss_value:.4f} pred={pred_val:.2f} true={true_val:.2f} grad={grad_norm:.3e}',
+            fontsize=11,
+        )
+        fig.tight_layout()
+        fig.savefig(debug_dir / f'epoch_{epoch:03d}_step_{step:05d}.png', dpi=120)
+        plt.close(fig)
+
+        csv_path = debug_dir / 'debug_step_metrics.csv'
+        file_exists = csv_path.exists()
+        with open(csv_path, 'a', newline='') as f:
+            w = csv.writer(f)
+            if not file_exists:
+                w.writerow(['epoch', 'step', 'loss', 'pred', 'true', 'grad_norm'])
+            w.writerow([epoch, step, loss_value, pred_val, true_val, grad_norm])
+    except Exception as e:
+        logger.warning('Could not save step debug visualization at epoch=%d step=%d: %s', epoch, step, e)
+
+
+def train_epoch(
+    model,
+    loader,
+    optimizer,
+    loss_fn,
+    device,
+    neg_pearson_coef: float = 0.0,
+    mae_coef: float = 1.0,
+    desc: str | None = None,
+    epoch: int = 0,
+    save_dir: Path | None = None,
+    debug_viz_every_steps: int = 0,
+):
     model.train()
     total_loss = 0.0
     count = 0
     iterator = tqdm(loader, desc=desc, leave=False)
-    for batch in iterator:
+    for step, batch in enumerate(iterator, start=1):
         # support datasets that may return ROI metadata: (clips, hrs[, roi_type, roi_bbox])
         if isinstance(batch, (list, tuple)) and len(batch) >= 2:
             clips = batch[0]
@@ -53,46 +192,57 @@ def train_epoch(model, loader, optimizer, loss_fn, device, desc: str | None = No
         hrs = hrs.to(device).unsqueeze(1)
 
         # build a simple centered Gaussian ROI map per-sample when explicit ROI was used
-        roi_map = None
-        if roi_types is not None:
-            try:
-                B = clips.size(0)
-                H = clips.size(-2)
-                W = clips.size(-1)
-                mask = torch.ones((B, 1, H, W), device=device)
-                for i, rt in enumerate(roi_types):
-                    if isinstance(rt, bytes):
-                        rt = rt.decode()
-                    if rt is None or rt == 'full':
-                        mask[i, 0] = 1.0
-                    else:
-                        ys = torch.linspace(-1, 1, H, device=device).unsqueeze(1).expand(H, W)
-                        xs = torch.linspace(-1, 1, W, device=device).unsqueeze(0).expand(H, W)
-                        dist2 = xs ** 2 + ys ** 2
-                        g = torch.exp(-dist2 / (0.5 ** 2))
-                        mask[i, 0] = g
-                roi_map = mask
-            except Exception:
-                roi_map = None
+        roi_map = _build_roi_map(clips, roi_types, device)
 
         optimizer.zero_grad()
         preds = model(clips, roi_map=roi_map) if roi_map is not None else model(clips)
-        loss = loss_fn(preds, hrs)
+        loss = float(mae_coef) * loss_fn(preds, hrs)
+        if neg_pearson_coef > 0.0:
+            loss = loss + float(neg_pearson_coef) * _neg_pearson_loss(preds, hrs)
         loss.backward()
+        grad_norm = _compute_grad_norm(model)
         optimizer.step()
+
+        if debug_viz_every_steps > 0 and save_dir is not None and (step % debug_viz_every_steps == 0):
+            attn_dict = None
+            try:
+                model.eval()
+                with torch.no_grad():
+                    clip_dbg = clips[:1]
+                    roi_dbg = roi_map[:1] if roi_map is not None else None
+                    _, attn_dict = model(clip_dbg, roi_map=roi_dbg, return_attention=True)
+            except Exception as e:
+                logger.warning('Failed to fetch attention for debug viz at epoch=%d step=%d: %s', epoch, step, e)
+            finally:
+                model.train()
+
+            _save_step_debug_visual(
+                save_dir=save_dir,
+                epoch=epoch,
+                step=step,
+                clips=clips,
+                preds=preds,
+                hrs=hrs,
+                loss_value=float(loss.item()),
+                grad_norm=float(grad_norm),
+                attn_dict=attn_dict,
+            )
+
         total_loss += loss.item() * clips.size(0)
         count += clips.size(0)
     return total_loss / max(1, count)
 
 
-def eval_model(model, loader, device, desc: str | None = None):
+def eval_model(model, loader, device, desc: str | None = None, max_batches: int = 0):
     model.eval()
     import numpy as np
     preds_all = []
     hrs_all = []
     with torch.no_grad():
         iterator = tqdm(loader, desc=desc, leave=False)
-        for batch in iterator:
+        for batch_idx, batch in enumerate(iterator):
+            if max_batches > 0 and batch_idx >= max_batches:
+                break
             if isinstance(batch, (list, tuple)) and len(batch) >= 2:
                 clips = batch[0]
                 hrs = batch[1]
@@ -128,21 +278,55 @@ def eval_model(model, loader, device, desc: str | None = None):
             out = model(clips, roi_map=roi_map) if roi_map is not None else model(clips)
             preds_all.append(out.cpu().numpy())
             hrs_all.append(hrs.numpy())
+    if not preds_all:
+        return float('nan'), {'pred_mean': float('nan'), 'pred_std': float('nan'), 'pred_min': float('nan'), 'pred_max': float('nan'), 'true_mean': float('nan'), 'true_std': float('nan')}
     preds = np.vstack(preds_all).ravel()
     hrs = np.hstack(hrs_all).ravel()
     mae = float(np.mean(np.abs(preds - hrs)))
-    return mae
+    pred_stats = {
+        'pred_mean': float(np.mean(preds)),
+        'pred_std': float(np.std(preds)),
+        'pred_min': float(np.min(preds)),
+        'pred_max': float(np.max(preds)),
+        'true_mean': float(np.mean(hrs)),
+        'true_std': float(np.std(hrs)),
+    }
+    return mae, pred_stats
 
 
 def main():
+    default_weight_decay = 1e-4
+    default_use_augment = True
+    default_warmup_epochs = 5
+    default_cosine_epochs = 10
+    default_min_lr = 1e-5
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--clips_dir', default='data/ubfc_clips')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose (DEBUG) logging')
     parser.add_argument('--epochs', type=int, default=3)
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--weight_decay', type=float, default=0.0, help='AdamW weight decay (L2 regularization)')
-    parser.add_argument('--augment', action='store_true', help='Enable simple data augmentations on the training set')
+    parser.add_argument('--frame_depth', type=int, default=128,
+                        help='Temporal clip length expected by TSM front-end (should match preprocessing clip_len)')
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--weight_decay', type=float, default=default_weight_decay,
+                        help='Weight decay for AdamW. Lower values can help avoid mean-collapse.')
+    parser.add_argument('--no_augment', action='store_true',
+                        help='Disable training-time augmentation for debugging collapse issues')
+    parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'huber'],
+                        help='Regression loss type')
+    parser.add_argument('--huber_delta', type=float, default=3.0,
+                        help='Delta used when --loss huber')
+    parser.add_argument('--neg_pearson_coef', type=float, default=0.1,
+                        help='Add negative Pearson term: total_loss = base_loss + coef * (1-r), where r is batch Pearson corr')
+    parser.add_argument('--two_stage_training', action='store_true',
+                        help='Enable two-stage training: stage1 (light MAE, heavy Pearson) then stage2 (full MAE+Pearson)')
+    parser.add_argument('--stage1_epochs', type=int, default=10,
+                        help='Number of epochs for stage1 (with light MAE). Total epochs must be > stage1_epochs')
+    parser.add_argument('--stage1_mae_coef', type=float, default=0.01,
+                        help='MAE coefficient in stage1 (e.g., 0.01 or 0.0 for Pearson-only)')
+    parser.add_argument('--stage2_mae_coef', type=float, default=1.0,
+                        help='MAE coefficient in stage2 (e.g., 1.0 for full MAE)')
     parser.add_argument('--save_dir', default='checkpoints')
     parser.add_argument('--max_samples', type=int, default=0,
                         help='If >0, limit dataset to this many samples for quick runs')
@@ -155,6 +339,10 @@ def main():
     parser.add_argument('--split_mode', type=str, default='clip_random',
                         choices=['clip_random', 'subject_disjoint'],
                         help='How to split train/val: random by clip, or disjoint by subject')
+    parser.add_argument('--debug_viz_every_steps', type=int, default=0,
+                        help='If >0, save quick debug visualizations every N training steps to checkpoints/debug_steps')
+    parser.add_argument('--train_eval_batches', type=int, default=10,
+                        help='Number of batches to sample for train-set eval each epoch (0=full, default=10 for speed)')
     args = parser.parse_args()
 
     # configure logging early so modules emit consistent messages
@@ -164,9 +352,22 @@ def main():
         logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(name)s: %(message)s')
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    use_augment = default_use_augment and (not args.no_augment)
     logger.info('Using device: %s', device)
+    logger.info('Training config: augment=%s, weight_decay=%.1e, loss=%s, neg_pearson_coef=%.3f',
+                use_augment, args.weight_decay, args.loss, args.neg_pearson_coef)
+    if args.two_stage_training:
+        logger.info('Two-stage training ENABLED: stage1=%d epochs (mae_coef=%.3f), stage2 (mae_coef=%.3f)',
+                    args.stage1_epochs, args.stage1_mae_coef, args.stage2_mae_coef)
+    logger.info(
+        'LR schedule: base_lr=%.1e, warmup_epochs=%d, cosine_epochs=%d, min_lr=%.1e',
+        args.lr,
+        default_warmup_epochs,
+        default_cosine_epochs,
+        default_min_lr,
+    )
 
-    ds = UBFCClipDataset(args.clips_dir)
+    ds = UBFCClipDataset(args.clips_dir, frame_depth=args.frame_depth)
     # Subject-aware selection
     def subject_from_name(fn: Path) -> str:
         name = fn.name
@@ -247,22 +448,37 @@ def main():
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
 
     # create dataset instances: enable augment only for training dataset
-    train_ds = UBFCClipDataset(args.clips_dir, augment=args.augment)
+    train_ds = UBFCClipDataset(args.clips_dir, augment=use_augment, frame_depth=args.frame_depth)
     train_ds.files = train_files
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4,
+        pin_memory=True, persistent_workers=True,
+    )
 
     if len(val_files) > 0:
-        val_ds = UBFCClipDataset(args.clips_dir, augment=False)
+        val_ds = UBFCClipDataset(args.clips_dir, augment=False, frame_depth=args.frame_depth)
         val_ds.files = val_files
-        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
+        val_loader = DataLoader(
+            val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4,
+            pin_memory=True, persistent_workers=True,
+        )
     else:
         val_loader = None
 
-    model = EfficientPhysMambaRegressor(in_channels=6)
+    model = EfficientPhysMambaRegressor(in_channels=6, frame_depth=args.frame_depth)
     model.to(device)
 
-    optimizer = torch_optim.AdamW(model.parameters(), lr=args.lr, weight_decay=float(args.weight_decay))
-    loss_fn = nn.MSELoss()
+    optimizer = torch_optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch_optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, default_cosine_epochs),
+        eta_min=default_min_lr,
+    )
+    cosine_steps_done = 0
+    if args.loss == 'huber':
+        loss_fn = nn.HuberLoss(delta=float(args.huber_delta))
+    else:
+        loss_fn = nn.MSELoss()
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -273,28 +489,99 @@ def main():
     train_losses = []
     train_maes = []
     val_maes = []
+    train_pred_stds = []
+    val_pred_stds = []
     metrics_csv = save_dir / 'training_metrics.csv'
     # write header
     with open(metrics_csv, 'w', newline='') as _f:
         w = csv.writer(_f)
-        w.writerow(['epoch', 'train_loss', 'train_mae', 'val_mae'])
-    for epoch in range(1, args.epochs + 1):
+        w.writerow(['epoch', 'train_loss', 'train_mae', 'val_mae', 'train_pred_std', 'val_pred_std'])
+    for epoch in tqdm(range(1, args.epochs + 1), desc='Training', total=args.epochs, leave=True, ncols=100, force_tqdm=True):
+        current_lr = float(optimizer.param_groups[0]['lr'])
         t0 = time.time()
-        train_loss = train_epoch(model, train_loader, optimizer, loss_fn, device)
-        # compute train MAE for monitoring
-        train_mae = eval_model(model, train_loader, device)
+        if args.two_stage_training:
+            if epoch <= args.stage1_epochs:
+                mae_coef = float(args.stage1_mae_coef)
+                stage_label = 'STAGE1(Pearson-heavy)'
+            else:
+                mae_coef = float(args.stage2_mae_coef)
+                stage_label = 'STAGE2(MAE+Pearson)'
+        else:
+            mae_coef = 1.0
+            stage_label = ''
+        train_loss = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            loss_fn,
+            device,
+            neg_pearson_coef=float(args.neg_pearson_coef),
+            mae_coef=mae_coef,
+            epoch=epoch,
+            save_dir=save_dir,
+            debug_viz_every_steps=int(args.debug_viz_every_steps),
+            desc=f'Epoch {epoch}/{args.epochs} {stage_label} [train]',
+        )
+        # compute train MAE for monitoring (limited to train_eval_batches for speed)
+        train_mae, train_stats = eval_model(model, train_loader, device, max_batches=int(args.train_eval_batches), desc=f'Epoch {epoch}/{args.epochs} [train-eval]')
         # compute val MAE if validation set exists
         if val_loader is not None:
-            val_mae = eval_model(model, val_loader, device)
+            val_mae, val_stats = eval_model(model, val_loader, device, desc=f'Epoch {epoch}/{args.epochs} [val-eval]')
         else:
             val_mae = float('nan')
+            val_stats = {
+                'pred_std': float('nan'),
+                'pred_mean': float('nan'),
+                'pred_min': float('nan'),
+                'pred_max': float('nan'),
+                'true_std': float('nan'),
+                'true_mean': float('nan'),
+            }
         t1 = time.time()
-        logger.info('Epoch %d/%d - train_loss=%.4f train_mae=%.4f val_mae=%.4f time=%.1fs', epoch, args.epochs, train_loss, train_mae, val_mae, t1-t0)
+        if args.two_stage_training:
+            logger.info(
+                'Epoch %d/%d [%s] - mae_coef=%.3f lr=%.2e train_loss=%.4f train_mae=%.4f val_mae=%.4f train_pred_std=%.4f val_pred_std=%.4f time=%.1fs',
+                epoch,
+                args.epochs,
+                stage_label,
+                mae_coef,
+                current_lr,
+                train_loss,
+                train_mae,
+                val_mae,
+                train_stats['pred_std'],
+                val_stats['pred_std'],
+                t1 - t0,
+            )
+        else:
+            logger.info(
+                'Epoch %d/%d - lr=%.2e train_loss=%.4f train_mae=%.4f val_mae=%.4f train_pred_std=%.4f val_pred_std=%.4f time=%.1fs',
+                epoch,
+                args.epochs,
+                current_lr,
+                train_loss,
+                train_mae,
+                val_mae,
+                train_stats['pred_std'],
+                val_stats['pred_std'],
+                t1 - t0,
+            )
+        if train_stats['pred_std'] < 1e-3:
+            logger.warning('Train predictions nearly constant (pred_std=%.6f). Consider lower weight_decay or disabling augment.', train_stats['pred_std'])
+        if val_loader is not None and val_stats['pred_std'] < 1e-3:
+            logger.warning('Val predictions nearly constant (pred_std=%.6f). Potential mean-collapse.', val_stats['pred_std'])
+
+        # Keep large LR for the first warmup epochs, then cosine-decay for a fixed window.
+        if epoch >= default_warmup_epochs and cosine_steps_done < default_cosine_epochs:
+            scheduler.step()
+            cosine_steps_done += 1
         # TensorBoard logs
         if writer is not None:
             writer.add_scalar('train/loss', train_loss, epoch)
+            writer.add_scalar('train/pred_std', train_stats['pred_std'], epoch)
             if val_loader is not None:
                 writer.add_scalar('val/mae', val_mae, epoch)
+                writer.add_scalar('val/pred_std', val_stats['pred_std'], epoch)
         ckpt = save_dir / f'model_epoch_{epoch}.pt'
         torch.save({'epoch': epoch, 'model_state': model.state_dict(), 'optim_state': optimizer.state_dict()}, ckpt)
         # save best model only if we have a valid validation MAE
@@ -310,9 +597,11 @@ def main():
         train_losses.append(train_loss)
         train_maes.append(train_mae)
         val_maes.append(val_mae)
+        train_pred_stds.append(train_stats['pred_std'])
+        val_pred_stds.append(val_stats['pred_std'])
         with open(metrics_csv, 'a', newline='') as f:
             w = csv.writer(f)
-            w.writerow([epoch, train_loss, train_mae, val_mae])
+            w.writerow([epoch, train_loss, train_mae, val_mae, train_stats['pred_std'], val_stats['pred_std']])
 
         # try to save simple plots for quick visualization
         try:
@@ -341,6 +630,99 @@ def main():
             plt.close()
         except Exception:
             logger.warning('Could not write training plots (matplotlib not available)')
+
+        # Visualize attention heatmaps every epoch
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.cm as cm
+            import numpy as np
+
+            model.eval()
+            with torch.no_grad():
+                # Randomly sample clips from different subjects for visualization
+                if val_loader is not None and len(val_ds.files) > 0:
+                    candidate_files = list(val_ds.files)
+                    random.shuffle(candidate_files)
+
+                    selected_files = []
+                    used_subjects = set()
+                    for fn in candidate_files:
+                        subj = subject_from_name(fn)
+                        if subj in used_subjects:
+                            continue
+                        selected_files.append(fn)
+                        used_subjects.add(subj)
+                        if len(selected_files) >= 4:
+                            break
+
+                    if len(selected_files) > 0:
+                        clips_list = []
+                        roi_types = []
+                        vis_subjects = []
+                        for fn in selected_files:
+                            data = torch.load(fn, weights_only=False)
+                            clips_list.append(data['clip'].float())
+                            roi_types.append(data.get('roi_type', 'full'))
+                            vis_subjects.append(subject_from_name(fn))
+
+                        clips = torch.stack(clips_list, dim=0).to(device)
+                        roi_map = _build_roi_map(clips, roi_types, device)
+
+                        # Forward with attention
+                        _out, attn_dict = model(clips, roi_map=roi_map, return_attention=True)
+
+                        # Visualize g1 and g2
+                        g1 = attn_dict['g1']  # (B, T, 1, H1, W1)
+                        g2 = attn_dict['g2']  # (B, T, 1, H2, W2)
+
+                        num_viz = g1.shape[0]
+
+                        fig, axes = plt.subplots(num_viz, 4, figsize=(12, 3 * num_viz))
+                        if num_viz == 1:
+                            axes = axes.reshape(1, -1)
+
+                        for bi in range(num_viz):
+                            # First frame, first gate
+                            ax = axes[bi, 0]
+                            hm = g1[bi, 0, 0].cpu().numpy()
+                            im = ax.imshow(hm, cmap='hot')
+                            ax.set_title(f'{vis_subjects[bi]} G1 Frame 0')
+                            ax.axis('off')
+                            plt.colorbar(im, ax=ax, fraction=0.046)
+
+                            # Middle frame, first gate
+                            ax = axes[bi, 1]
+                            mid_t = g1.shape[1] // 2
+                            hm = g1[bi, mid_t, 0].cpu().numpy()
+                            im = ax.imshow(hm, cmap='hot')
+                            ax.set_title(f'{vis_subjects[bi]} G1 Frame {mid_t}')
+                            ax.axis('off')
+                            plt.colorbar(im, ax=ax, fraction=0.046)
+
+                            # First frame, second gate
+                            ax = axes[bi, 2]
+                            hm = g2[bi, 0, 0].cpu().numpy()
+                            im = ax.imshow(hm, cmap='hot')
+                            ax.set_title(f'{vis_subjects[bi]} G2 Frame 0')
+                            ax.axis('off')
+                            plt.colorbar(im, ax=ax, fraction=0.046)
+
+                            # Middle frame, second gate
+                            ax = axes[bi, 3]
+                            mid_t = g2.shape[1] // 2
+                            hm = g2[bi, mid_t, 0].cpu().numpy()
+                            im = ax.imshow(hm, cmap='hot')
+                            ax.set_title(f'{vis_subjects[bi]} G2 Frame {mid_t}')
+                            ax.axis('off')
+                            plt.colorbar(im, ax=ax, fraction=0.046)
+
+                        plt.suptitle(f'Epoch {epoch} - Attention Heatmaps (different subjects)', fontsize=14)
+                        plt.tight_layout()
+                        plt.savefig(save_dir / f'attention_epoch_{epoch:03d}.png', dpi=80)
+                        plt.close()
+                        logger.info(f'Saved attention heatmap visualization to {save_dir / f"attention_epoch_{epoch:03d}.png"}')
+        except Exception as e:
+            logger.warning(f'Could not save attention heatmaps: {e}')
 
 
 if __name__ == '__main__':

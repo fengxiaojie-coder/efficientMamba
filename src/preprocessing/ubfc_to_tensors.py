@@ -8,12 +8,13 @@ import argparse
 from pathlib import Path
 from typing import Tuple
 
+import logging
 import cv2
 import numpy as np
 import torch
 
 from src.preprocess.ubfc_rPPG_dataset_info import read_ground_truth, get_video_info
-import logging
+from src.preprocessing.roi_extract import transform_frames_with_roi
 
 logger = logging.getLogger(__name__)
 
@@ -35,68 +36,6 @@ def extract_frames(video_path: Path, img_size: int) -> Tuple[np.ndarray, float]:
     frames = np.stack(frames, axis=0)  # (N,H,W,3)
     return frames, fps
 
-
-def _detect_face_bbox_haar(frames: np.ndarray) -> tuple[int, int, int, int] | None:
-    """Detect face bbox across frames using OpenCV Haar cascade.
-
-    Returns a single bbox (x1,y1,x2,y2) computed as the median of detected boxes,
-    or None if no face found.
-    """
-    cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-    clf = cv2.CascadeClassifier(cascade_path)
-    bboxes = []
-    for i in range(min(30, frames.shape[0])):
-        frame = frames[i]
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        dets = clf.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, flags=cv2.CASCADE_SCALE_IMAGE)
-        if len(dets) == 0:
-            continue
-        # pick largest
-        areas = [w * h for (x, y, w, h) in dets]
-        idx = int(np.argmax(areas))
-        x, y, w, h = dets[idx]
-        bboxes.append((x, y, x + w, y + h))
-    if not bboxes:
-        return None
-    arr = np.array(bboxes, dtype=np.int32)
-    x1 = int(np.median(arr[:, 0]))
-    y1 = int(np.median(arr[:, 1]))
-    x2 = int(np.median(arr[:, 2]))
-    y2 = int(np.median(arr[:, 3]))
-    return x1, y1, x2, y2
-
-
-def _detect_face_bbox_mediapipe(frames: np.ndarray) -> tuple[int, int, int, int] | None:
-    try:
-        import mediapipe as mp
-    except Exception:
-        return None
-    mp_face = mp.solutions.face_detection
-    bboxes = []
-    with mp_face.FaceDetection(model_selection=0, min_detection_confidence=0.5) as detector:
-        for i in range(min(30, frames.shape[0])):
-            img = frames[i]
-            # mediapipe expects RGB
-            results = detector.process(img)
-            if not results.detections:
-                continue
-            # pick first detection
-            det = results.detections[0]
-            h, w, _ = img.shape
-            box = det.location_data.relative_bounding_box
-            x1 = int(box.xmin * w)
-            y1 = int(box.ymin * h)
-            x2 = int((box.xmin + box.width) * w)
-            y2 = int((box.ymin + box.height) * h)
-            bboxes.append((x1, y1, x2, y2))
-    if not bboxes:
-        return None
-    arr = np.array(bboxes, dtype=np.int32)
-    x1 = int(np.median(arr[:, 0]))
-    y1 = int(np.median(arr[:, 1]))
-    x2 = int(np.median(arr[:, 2]))
-    y2 = int(np.median(arr[:, 3]))
-    return x1, y1, x2, y2
 
 
 def make_clips(frames: np.ndarray, clip_len: int, stride: int) -> np.ndarray:
@@ -130,50 +69,19 @@ def compute_clip_hr(start_frame: int, clip_len: int, fps: float, hr_times: np.nd
     return float(hr_values[idx])
 
 
-def _apply_roi_and_resize(frames: np.ndarray, roi_type: str, pad: float, img_size: int) -> tuple[np.ndarray, tuple[int, int, int, int] | None]:
-    # frames: (N,H,W,3)
-    if roi_type == 'full':
-        resized = [cv2.resize(f, (img_size, img_size)) for f in frames]
-        return np.stack(resized, axis=0), None
 
-    bbox = None
-    if roi_type == 'haar':
-        bbox = _detect_face_bbox_haar(frames)
-    elif roi_type == 'mediapipe':
-        bbox = _detect_face_bbox_mediapipe(frames)
-
-    if bbox is None:
-        # fallback to full frame
-        resized = [cv2.resize(f, (img_size, img_size)) for f in frames]
-        return np.stack(resized, axis=0), None
-
-    x1, y1, x2, y2 = bbox
-    h, w = frames.shape[1], frames.shape[2]
-    cx = (x1 + x2) / 2.0
-    cy = (y1 + y2) / 2.0
-    bw = (x2 - x1) * pad
-    bh = (y2 - y1) * pad
-    x1n = int(max(0, cx - bw / 2.0))
-    x2n = int(min(w, cx + bw / 2.0))
-    y1n = int(max(0, cy - bh / 2.0))
-    y2n = int(min(h, cy + bh / 2.0))
-    cropped = [f[y1n:y2n, x1n:x2n] for f in frames]
-    resized = [cv2.resize(f, (img_size, img_size)) for f in cropped]
-    # return resized frames and the bbox used (in original frame coords)
-    return np.stack(resized, axis=0), (int(x1), int(y1), int(x2), int(y2))
-
-
-def process_subject(subject_dir: Path, out_dir: Path, clip_len: int = 16, stride: int = 8, img_size: int = 72, roi: str = 'mediapipe', roi_pad: float = 1.2):
+def process_subject(subject_dir: Path, out_dir: Path, clip_len: int = 128, stride: int = 8, img_size: int = 72,
+                    roi: str = 'bbox', roi_pad: float = 0.0, forehead_ratio: float = 0.20):
     gt_path = subject_dir / 'ground_truth.txt'
     video_path = None
-    for ext in ('.avi', '.mp4', '.mov'):
+    for ext in ('.avi'):
         candidate = subject_dir / f'vid{ext}'
         if candidate.exists():
             video_path = candidate
             break
     if video_path is None:
         # fallback: pick any video file
-        vids = list(subject_dir.glob('*.avi')) + list(subject_dir.glob('*.mp4'))
+        vids = list(subject_dir.glob('*.avi'))
         if vids:
             video_path = vids[0]
     if not gt_path.exists() or video_path is None:
@@ -182,7 +90,7 @@ def process_subject(subject_dir: Path, out_dir: Path, clip_len: int = 16, stride
 
     ppg, hr, t = read_ground_truth(gt_path)
     frames, fps = extract_frames(video_path, img_size)
-    frames, bbox = _apply_roi_and_resize(frames, roi_type=roi, pad=roi_pad, img_size=img_size)
+    frames, bbox = transform_frames_with_roi(frames, roi=roi, size=img_size, pad=roi_pad, forehead_ratio=forehead_ratio)
     clips = make_clips(frames, clip_len=clip_len, stride=stride)
     saved = 0
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -201,12 +109,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--src', required=True)
     parser.add_argument('--out', required=True)
-    parser.add_argument('--clip_len', type=int, default=16)
+    parser.add_argument('--clip_len', type=int, default=128)
     parser.add_argument('--stride', type=int, default=8)
     parser.add_argument('--size', type=int, default=72)
-    parser.add_argument('--roi', type=str, default='mediapipe', choices=['full', 'haar', 'mediapipe'],
-                        help='ROI strategy: full frame, haar cascade, or mediapipe')
-    parser.add_argument('--roi_pad', type=float, default=1.2, help='Padding multiplier applied to detected bbox')
+    parser.add_argument('--roi', type=str, default='bbox', choices=['full', 'haar', 'mediapipe', 'ellipse', 'bbox'],
+                        help='ROI strategy: full frame, haar cascade, mediapipe bbox, ellipse, or compact bbox crop')
+    parser.add_argument('--roi_pad', type=float, default=0.0, help='Extra padding ratio applied to detected bbox')
+    parser.add_argument('--forehead_ratio', type=float, default=0.20,
+                        help='Extra top expansion ratio for bbox ROI (relative to face-box height). Set 0 to disable.')
     args = parser.parse_args()
     src = Path(args.src)
     out = Path(args.out)
@@ -214,7 +124,7 @@ def main():
     total = 0
     for s in subjects:
         n = process_subject(s, out, clip_len=args.clip_len, stride=args.stride, img_size=args.size,
-                            roi=args.roi, roi_pad=args.roi_pad)
+                            roi=args.roi, roi_pad=args.roi_pad, forehead_ratio=args.forehead_ratio)
         logger.info("Processed %s: %d clips", s.name, n)
         total += n
     logger.info("Total clips saved: %d", total)

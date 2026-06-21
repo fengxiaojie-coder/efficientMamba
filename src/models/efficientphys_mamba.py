@@ -150,13 +150,19 @@ class TemporalBackbone(nn.Module):
 class EfficientPhysMambaRegressor(nn.Module):
     """End-to-end fusion model for rPPG / HR regression."""
 
-    def __init__(self, in_channels: int = 6, embed_dim: int = 128, d_state: int = 16, d_conv: int = 4, use_mamba: bool = True, img_size: int = 72):
+    def __init__(self, in_channels: int = 6, embed_dim: int = 128, d_state: int = 16, d_conv: int = 4,
+                 use_mamba: bool = True, img_size: int = 72, frame_depth: int = 128):
         super().__init__()
         # use the faithful EfficientPhys front to produce the d10 embedding
         # note: EfficientPhysFront accepts total per-frame channels (6 for
         # motion+appearance). It also supports 3-channel inputs by internal
         # duplication for compatibility.
-        self.feature_extractor = EfficientPhysFront(in_channels=in_channels, nb_dense=embed_dim, img_size=img_size)
+        self.feature_extractor = EfficientPhysFront(
+            in_channels=in_channels,
+            nb_dense=embed_dim,
+            img_size=img_size,
+            frame_depth=frame_depth,
+        )
         self.temporal = TemporalBackbone(d_model=embed_dim, d_state=d_state, d_conv=d_conv, use_mamba=use_mamba)
         self.head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 2),
@@ -165,15 +171,26 @@ class EfficientPhysMambaRegressor(nn.Module):
             nn.Linear(embed_dim // 2, 1),
         )
 
-    def forward_features(self, frames: Tensor, roi_map: Optional[Tensor] = None) -> Tensor:
-        # delegate to EfficientPhysFront which returns [B, T, D]
-        return self.feature_extractor.forward_features(frames, roi_map=roi_map)
+    def forward_features(self, frames: Tensor, roi_map: Optional[Tensor] = None, return_attention: bool = False) -> Tensor | tuple:
+        # delegate to EfficientPhysFront which returns [B, T, D] or ([B, T, D], attention_dict)
+        return self.feature_extractor.forward_features(frames, roi_map=roi_map, return_attention=return_attention)
 
-    def forward(self, frames: Tensor, roi_map: Optional[Tensor] = None) -> Tensor:
-        features = self.forward_features(frames, roi_map=roi_map)
+    def forward(self, frames: Tensor, roi_map: Optional[Tensor] = None, return_attention: bool = False) -> Tensor | tuple:
+        result = self.forward_features(frames, roi_map=roi_map, return_attention=return_attention)
+
+        if return_attention:
+            features, attn_dict = result
+        else:
+            features = result
+            attn_dict = None
+
         temporal_features = self.temporal(features)
         pooled = temporal_features.mean(dim=1)
-        return self.head(pooled)
+        output = self.head(pooled)
+
+        if return_attention:
+            return output, attn_dict
+        return output
 
 
 @dataclass
@@ -187,7 +204,7 @@ def smoke_test() -> SmokeTestResult:
     """Run a tiny forward pass on random data."""
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = EfficientPhysMambaRegressor(use_mamba=torch.cuda.is_available(), img_size=72).to(device)
+    model = EfficientPhysMambaRegressor(use_mamba=torch.cuda.is_available(), img_size=72, frame_depth=16).to(device)
     dummy = torch.randn(2, 16, 6, 72, 72, device=device)
     features = model.forward_features(dummy)
     output = model(dummy)

@@ -11,9 +11,33 @@ from torch.utils.data import Dataset
 
 
 class UBFCClipDataset(Dataset):
-    def __init__(self, clips_dir: str | Path, augment: bool = False):
+    def __init__(self, clips_dir: str | Path, augment: bool = False, frame_depth: int | None = None):
         self.clips_dir = Path(clips_dir)
-        self.files: List[Path] = sorted(self.clips_dir.glob('**/*.pt'))
+        all_files = sorted(self.clips_dir.glob('**/*.pt'))
+        if frame_depth is not None:
+            # Keep only clips whose temporal dimension matches frame_depth.
+            # We peek at just the metadata rather than loading the full tensor.
+            filtered = []
+            skipped = 0
+            for f in all_files:
+                try:
+                    d = torch.load(f, weights_only=False)
+                    if int(d['clip'].shape[0]) == frame_depth:
+                        filtered.append(f)
+                    else:
+                        skipped += 1
+                except Exception:
+                    skipped += 1
+            if skipped:
+                import logging
+                logging.getLogger(__name__).warning(
+                    'UBFCClipDataset: skipped %d clips whose T != %d (mixed dataset detected). '
+                    'Re-run preprocessing with --clip_len %d to fix.',
+                    skipped, frame_depth, frame_depth,
+                )
+            self.files: List[Path] = filtered
+        else:
+            self.files: List[Path] = all_files
         self.augment = bool(augment)
 
     def __len__(self) -> int:

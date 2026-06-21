@@ -62,7 +62,7 @@ class EfficientPhysFront(nn.Module):
     """
 
     def __init__(self, in_channels: int = 6, nb_filters1: int = 32, nb_filters2: int = 64,
-                 nb_dense: int = 128, kernel_size: int = 3, frame_depth: int = 16, img_size: int = 72):
+                 nb_dense: int = 128, kernel_size: int = 3, frame_depth: int = 128, img_size: int = 72):
         super().__init__()
         # in_channels here is the total channels per frame (6 when using both
         # motion+appearance). Internal branch convs expect 3 channels each.
@@ -118,11 +118,13 @@ class EfficientPhysFront(nn.Module):
         else:
             raise Exception('Unsupported image size')
 
-    def forward_features(self, frames: Tensor, roi_map: Optional[Tensor] = None) -> Tensor:
+    def forward_features(self, frames: Tensor, roi_map: Optional[Tensor] = None, return_attention: bool = False) -> Tensor | tuple[Tensor, dict]:
         """Compute embeddings from a video clip.
 
         frames: [B, T, C, H, W] where C==6 (diff then raw)
-        returns: [B, T, nb_dense]
+        roi_map: optional spatial bias map
+        return_attention: if True, also return attention maps g1 and g2 for visualization
+        returns: [B, T, nb_dense] or ([B, T, nb_dense], {'g1': Tensor, 'g2': Tensor})
         """
         if frames.dim() != 5:
             raise ValueError('Expected frames [B,T,C,H,W]')
@@ -130,6 +132,11 @@ class EfficientPhysFront(nn.Module):
         B, T, C, H, W = frames.shape
         if C not in (3, 6):
             raise ValueError('Expected C==6 (both) or C==3')
+        if T != self.frame_depth:
+            raise ValueError(
+                f'Expected T=={self.frame_depth} to match frame_depth, got T=={T}. '
+                'Please keep preprocessing clip_len and model frame_depth consistent.'
+            )
 
         # reshape to (nt, c, h, w) consistent with original implementation
         nt = B * T
@@ -155,15 +162,15 @@ class EfficientPhysFront(nn.Module):
         r2 = torch.tanh(self.apperance_conv2(r1))
 
         # gating 1
-        g1 = torch.sigmoid(self.apperance_att_conv1(r2))
+        g1_raw = torch.sigmoid(self.apperance_att_conv1(r2))
         # prepare roi map expanded to nt if provided (resize to g1 spatial size)
         roi_map_nt1 = None
         if roi_map is not None:
-            B, T = frames.shape[0], frames.shape[1]
-            _, _, H1, W1 = g1.shape
+            B_tmp, T_tmp = frames.shape[0], frames.shape[1]
+            _, _, H1, W1 = g1_raw.shape
             roi_resized1 = torch.nn.functional.interpolate(roi_map, size=(H1, W1), mode='bilinear', align_corners=False)
-            roi_map_nt1 = roi_resized1.unsqueeze(1).expand(-1, T, -1, -1, -1).reshape(-1, 1, H1, W1)
-        g1 = self.attn_mask_1(g1, roi_map=roi_map_nt1)
+            roi_map_nt1 = roi_resized1.unsqueeze(1).expand(-1, T_tmp, -1, -1, -1).reshape(-1, 1, H1, W1)
+        g1 = self.attn_mask_1(g1_raw, roi_map=roi_map_nt1)
         gated1 = d2 * g1
 
         d3 = self.avg_pooling_1(gated1)
@@ -181,14 +188,14 @@ class EfficientPhysFront(nn.Module):
         r6 = torch.tanh(self.apperance_conv4(r5))
 
         # gating 2
-        g2 = torch.sigmoid(self.apperance_att_conv2(r6))
+        g2_raw = torch.sigmoid(self.apperance_att_conv2(r6))
         # prepare roi_map for g2 spatial size if available
         roi_map_nt2 = None
         if roi_map is not None:
-            _, _, H2, W2 = g2.shape
+            _, _, H2, W2 = g2_raw.shape
             roi_resized2 = torch.nn.functional.interpolate(roi_map, size=(H2, W2), mode='bilinear', align_corners=False)
             roi_map_nt2 = roi_resized2.unsqueeze(1).expand(-1, T, -1, -1, -1).reshape(-1, 1, H2, W2)
-        g2 = self.attn_mask_2(g2, roi_map=roi_map_nt2)
+        g2 = self.attn_mask_2(g2_raw, roi_map=roi_map_nt2)
         gated2 = d6 * g2
 
         d7 = self.avg_pooling_3(gated2)
@@ -198,6 +205,13 @@ class EfficientPhysFront(nn.Module):
 
         # reshape back to [B, T, D]
         out = d10.view(B, T, -1)
+
+        if return_attention:
+            attn_dict = {
+                'g1': g1.view(B, T, 1, g1.shape[-2], g1.shape[-1]),
+                'g2': g2.view(B, T, 1, g2.shape[-2], g2.shape[-1]),
+            }
+            return out, attn_dict
         return out
 
 
