@@ -26,6 +26,8 @@ def main() -> None:
     parser.add_argument('--sample_dir', required=True, help='UBFC subject directory, e.g. dataSet/UBFC-rPPG/subject1')
     parser.add_argument('--roi', type=str, default='bbox', choices=['full', 'haar', 'mediapipe', 'ellipse', 'bbox'])
     parser.add_argument('--roi_pad', type=float, default=0.0)
+    parser.add_argument('--forehead_ratio', type=float, default=0.20,
+                        help='Extra top expansion ratio for bbox/haar ROI (relative to face-box height)')
     parser.add_argument('--size', type=int, default=72)
     parser.add_argument('--out', type=str, default='results/roi_visualization')
     parser.add_argument('--frame_index', type=int, default=0, help='Which frame to visualize')
@@ -46,7 +48,13 @@ def main() -> None:
     frames, _fps = extract_frames(video_path, img_size=args.size)
 
     frame_index = max(0, min(int(args.frame_index), frames.shape[0] - 1))
-    resized, bbox = transform_frames_with_roi(frames, roi=args.roi, size=args.size, pad=args.roi_pad)
+    resized, bbox = transform_frames_with_roi(
+        frames,
+        roi=args.roi,
+        size=args.size,
+        pad=args.roi_pad,
+        forehead_ratio=args.forehead_ratio,
+    )
 
     raw_frame = frames[frame_index]
     roi_frame = resized[frame_index]
@@ -76,7 +84,13 @@ def main() -> None:
     axes[2].imshow(np.clip(raw_frame.astype(np.float32) * 0.7 + 40, 0, 255).astype(np.uint8))
     axes[2].set_title('Visualization note')
     axes[2].axis('off')
-    note = 'Green box = detected face ROI\nEllipse ROI blacks out outside-face regions\nBBox ROI keeps a compact face crop\nRight = resized ROI used by model'
+    note = (
+        'Green box = detected face ROI\n'
+        'Ellipse ROI blacks out outside-face regions\n'
+        'BBox/haar ROI keep a compact face crop\n'
+        'Forehead_ratio extends the top edge upward\n'
+        'Right = resized ROI used by model'
+    )
     axes[2].text(
         0.02,
         0.05,

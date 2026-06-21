@@ -1,4 +1,4 @@
---extra-index-url https://download.pytorch.org/whl/cu126
+--extra-index-url https://download.pytorch.org/whl/cu128
 
 pandas
 torch==2.7.0
@@ -17,5 +17,5 @@ protobuf==3.20.3
 tensorboard
 mediapipe
 # Cloud/GPU note:
-# This file now targets a CUDA-enabled PyTorch wheel for cloud Linux environments.
+# This file targets a CUDA-enabled PyTorch wheel for cloud Linux environments.
 # If you need the optional Mamba backend, use requirements-mamba.txt instead.

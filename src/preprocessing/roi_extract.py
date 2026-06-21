@@ -62,7 +62,12 @@ def _median_bbox(bboxes: Sequence[BBox]) -> Optional[BBox]:
     return int(med[0]), int(med[1]), int(med[2]), int(med[3])
 
 
-def detect_face_bbox_haar(frames: Sequence[np.ndarray], pad: float = 0.0, max_frames: int = 30) -> Optional[BBox]:
+def detect_face_bbox_haar(
+    frames: Sequence[np.ndarray],
+    pad: float = 0.0,
+    forehead_ratio: float = 0.20,
+    max_frames: int = 30,
+) -> Optional[BBox]:
     cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     face_cascade = cv2.CascadeClassifier(cascade_path)
     if face_cascade.empty():
@@ -83,7 +88,8 @@ def detect_face_bbox_haar(frames: Sequence[np.ndarray], pad: float = 0.0, max_fr
     if bbox is None:
         return None
     h, w = frames[0].shape[:2]
-    return _pad_bbox(bbox, pad, w, h)
+    padded = _pad_bbox(bbox, pad, w, h)
+    return _extend_forehead(padded, forehead_ratio=forehead_ratio, width=w, height=h)
 
 
 def detect_face_bbox_mediapipe(frames: Sequence[np.ndarray], pad: float = 0.0, max_frames: int = 30) -> Optional[BBox]:
@@ -195,7 +201,7 @@ def detect_face_bbox(
     max_frames: int = 30,
 ) -> Optional[BBox]:
     if roi == "haar":
-        return detect_face_bbox_haar(frames, pad=pad, max_frames=max_frames)
+        return detect_face_bbox_haar(frames, pad=pad, forehead_ratio=forehead_ratio, max_frames=max_frames)
     if roi == "mediapipe":
         return detect_face_bbox_mediapipe(frames, pad=pad, max_frames=max_frames)
     if roi == "bbox":
