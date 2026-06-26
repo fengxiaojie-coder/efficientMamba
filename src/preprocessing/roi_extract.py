@@ -8,11 +8,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-try:
-    import mediapipe as mp
-except ImportError:  # pragma: no cover - optional dependency
-    mp = None
-
 BBox = Tuple[int, int, int, int]
 
 
@@ -41,17 +36,33 @@ def _pad_bbox(bbox: BBox, pad: float, width: int, height: int) -> BBox:
     return _clip_bbox(x1 - delta_x, y1 - delta_y, box_w + 2 * delta_x, box_h + 2 * delta_y, width, height)
 
 
-def _extend_forehead(bbox: BBox, forehead_ratio: float, width: int, height: int) -> BBox:
-    """Extend the top edge upward to include forehead region.
+def _expand_bbox_directional(
+    bbox: BBox,
+    forehead_ratio: float,
+    side_ratio: float,
+    bottom_ratio: float,
+    width: int,
+    height: int,
+) -> BBox:
+    """Expand bbox with directional margins relative to face-box size.
 
-    forehead_ratio is relative to the detected face-box height.
+    forehead_ratio: extra top margin relative to box height.
+    side_ratio: extra left/right margin relative to box width.
+    bottom_ratio: extra bottom margin relative to box height.
     """
-    if forehead_ratio <= 0:
+    if forehead_ratio <= 0 and side_ratio <= 0 and bottom_ratio <= 0:
         return bbox
     x1, y1, x2, y2 = bbox
+    box_w = x2 - x1
     box_h = y2 - y1
     extra_top = int(round(box_h * forehead_ratio))
-    return _clip_bbox(x1, y1 - extra_top, x2 - x1, y2 - (y1 - extra_top), width, height)
+    extra_side = int(round(box_w * side_ratio))
+    extra_bottom = int(round(box_h * bottom_ratio))
+    new_x1 = x1 - extra_side
+    new_y1 = y1 - extra_top
+    new_w = (x2 + extra_side) - new_x1
+    new_h = (y2 + extra_bottom) - new_y1
+    return _clip_bbox(new_x1, new_y1, new_w, new_h, width, height)
 
 
 def _median_bbox(bboxes: Sequence[BBox]) -> Optional[BBox]:
@@ -66,6 +77,8 @@ def detect_face_bbox_haar(
     frames: Sequence[np.ndarray],
     pad: float = 0.0,
     forehead_ratio: float = 0.20,
+    side_ratio: float = 0.20,
+    bottom_ratio: float = 0.20,
     max_frames: int = 30,
 ) -> Optional[BBox]:
     cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -89,11 +102,22 @@ def detect_face_bbox_haar(
         return None
     h, w = frames[0].shape[:2]
     padded = _pad_bbox(bbox, pad, w, h)
-    return _extend_forehead(padded, forehead_ratio=forehead_ratio, width=w, height=h)
+    return _expand_bbox_directional(
+        padded,
+        forehead_ratio=forehead_ratio,
+        side_ratio=side_ratio,
+        bottom_ratio=bottom_ratio,
+        width=w,
+        height=h,
+    )
 
 
 def detect_face_bbox_mediapipe(frames: Sequence[np.ndarray], pad: float = 0.0, max_frames: int = 30) -> Optional[BBox]:
-    if mp is None:
+    # Import lazily so non-mediapipe ROI modes (e.g., haar/full) do not depend on
+    # mediapipe binary compatibility in the runtime environment.
+    try:
+        import mediapipe as mp
+    except ImportError:
         logger.warning("mediapipe is not installed; falling back to full-frame ROI")
         return None
 
@@ -198,20 +222,39 @@ def detect_face_bbox(
     roi: str = "bbox",
     pad: float = 0.0,
     forehead_ratio: float = 0.20,
+    side_ratio: float = 0.20,
+    bottom_ratio: float = 0.20,
     max_frames: int = 30,
 ) -> Optional[BBox]:
     if roi == "haar":
-        return detect_face_bbox_haar(frames, pad=pad, forehead_ratio=forehead_ratio, max_frames=max_frames)
+        return detect_face_bbox_haar(
+            frames,
+            pad=pad,
+            forehead_ratio=forehead_ratio,
+            side_ratio=side_ratio,
+            bottom_ratio=bottom_ratio,
+            max_frames=max_frames,
+        )
     if roi == "mediapipe":
         return detect_face_bbox_mediapipe(frames, pad=pad, max_frames=max_frames)
     if roi == "bbox":
         base_bbox = detect_face_bbox_mediapipe(frames, pad=pad, max_frames=max_frames) or detect_face_bbox_haar(
             frames,
             pad=pad,
+            forehead_ratio=0.0,
+            side_ratio=0.0,
+            bottom_ratio=0.0,
             max_frames=max_frames,
         ) or _default_face_bbox(frames[0])
         h, w = frames[0].shape[:2]
-        return _extend_forehead(base_bbox, forehead_ratio=forehead_ratio, width=w, height=h)
+        return _expand_bbox_directional(
+            base_bbox,
+            forehead_ratio=forehead_ratio,
+            side_ratio=side_ratio,
+            bottom_ratio=bottom_ratio,
+            width=w,
+            height=h,
+        )
     return None
 
 
@@ -221,11 +264,20 @@ def transform_frames_with_roi(
     size: int = 72,
     pad: float = 0.0,
     forehead_ratio: float = 0.20,
+    side_ratio: float = 0.20,
+    bottom_ratio: float = 0.20,
 ) -> tuple[np.ndarray, Optional[BBox]]:
     if frames.ndim != 4 or frames.shape[-1] != 3:
         raise ValueError(f"Expected frames with shape [N, H, W, 3], got {frames.shape}")
 
-    bbox = detect_face_bbox(frames, roi=roi, pad=pad, forehead_ratio=forehead_ratio)
+    bbox = detect_face_bbox(
+        frames,
+        roi=roi,
+        pad=pad,
+        forehead_ratio=forehead_ratio,
+        side_ratio=side_ratio,
+        bottom_ratio=bottom_ratio,
+    )
     processed = [
         apply_roi_and_resize(frame, roi=roi, size=size, bbox=bbox)
         for frame in frames

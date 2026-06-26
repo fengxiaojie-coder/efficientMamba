@@ -1,5 +1,6 @@
 """Dataset wrapper for preprocessed clip .pt files.
-Each .pt file is expected to contain {'clip': Tensor[T,6,H,W], 'hr': float}.
+Each .pt file is expected to contain {'clip': Tensor[T,6,H,W], 'hr': float, 'ppg': [T]}.
+Returns (clip, ppg_waveform, roi_type, roi_bbox) where ppg_waveform is the ground-truth PPG sequence [T].
 """
 from __future__ import annotations
 
@@ -45,10 +46,20 @@ class UBFCClipDataset(Dataset):
 
     def __getitem__(self, idx: int):
         fn = self.files[idx]
-        data = torch.load(fn, weights_only=False)  # clip: (T,6,H,W), hr: float
+        data = torch.load(fn, weights_only=False)  # clip: (T,6,H,W), hr: float, ppg: [T]
         # clip: (T,6,H,W)
         clip = data['clip'].float()
-        hr = torch.tensor(float(data.get('hr', 0.0)), dtype=torch.float32)
+
+        # Extract PPG waveform as primary target; fall back to HR if PPG missing
+        ppg_data = data.get('ppg', None)
+        if ppg_data is not None:
+            ppg = torch.tensor(ppg_data, dtype=torch.float32).squeeze()  # [T]
+        else:
+            # Fallback: use HR scalar replicated to T frames (legacy behavior)
+            hr_val = float(data.get('hr', 0.0))
+            T = clip.shape[0]
+            ppg = torch.full((T,), hr_val, dtype=torch.float32)
+
         # optional ROI metadata saved during preprocessing
         roi_type = data.get('roi_type', 'full')
         roi_bbox = data.get('roi_bbox', None)
@@ -74,7 +85,7 @@ class UBFCClipDataset(Dataset):
             noise = torch.randn_like(clip) * 0.01
             clip = clip + noise
 
-        return clip, hr, roi_type, roi_bbox
+        return clip, ppg, roi_type, roi_bbox
 
 
 if __name__ == '__main__':
@@ -85,7 +96,7 @@ if __name__ == '__main__':
     if len(ds) > 0:
         item = ds[0]
         if isinstance(item, (list, tuple)) and len(item) >= 2:
-            c, h = item[0], item[1]
+            c, p = item[0], item[1]
         else:
-            c, h = item
-        logger.info('clip shape %s hr %s', c.shape, h.item())
+            c, p = item
+        logger.info('clip shape %s ppg shape %s', c.shape, p.shape)

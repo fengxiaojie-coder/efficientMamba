@@ -1,6 +1,7 @@
 """Convert UBFC dataset videos to clip tensors of shape [T,6,H,W].
 
-Produces one .pt file per clip containing {'clip': Tensor[T,6,H,W], 'hr': float}.
+Produces one .pt file per clip containing clip features, clip HR label,
+and a frame-aligned PPG waveform segment for waveform-level evaluation.
 """
 from __future__ import annotations
 
@@ -13,10 +14,26 @@ import cv2
 import numpy as np
 import torch
 
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover
+    tqdm = None
+
 from src.preprocess.ubfc_rPPG_dataset_info import read_ground_truth, get_video_info
 from src.preprocessing.roi_extract import transform_frames_with_roi
 
 logger = logging.getLogger(__name__)
+
+
+def _zscore_signal(sig: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    sig = np.asarray(sig, dtype=np.float32).squeeze()
+    if sig.size == 0:
+        return np.zeros((0,), dtype=np.float32)
+    mean = float(np.mean(sig))
+    std = float(np.std(sig))
+    if std < eps:
+        return (sig - mean).astype(np.float32)
+    return ((sig - mean) / std).astype(np.float32)
 
 
 def extract_frames(video_path: Path, img_size: int) -> Tuple[np.ndarray, float]:
@@ -69,40 +86,187 @@ def compute_clip_hr(start_frame: int, clip_len: int, fps: float, hr_times: np.nd
     return float(hr_values[idx])
 
 
+def extract_clip_ppg(start_frame: int, clip_len: int, fps: float, ppg_times: np.ndarray, ppg_values: np.ndarray) -> np.ndarray:
+    """Interpolate ground-truth PPG to clip frame timestamps.
+
+    Returns an array of length clip_len aligned to frame times
+    t = (start_frame + k) / fps, k=0..clip_len-1.
+    """
+    frame_times = (start_frame + np.arange(clip_len, dtype=np.float32)) / float(fps)
+    if ppg_values.size == 0:
+        return np.zeros((clip_len,), dtype=np.float32)
+    if ppg_times.size != ppg_values.size or ppg_times.size == 0:
+        # Fallback when timestamps are missing/inconsistent.
+        src_x = np.linspace(0.0, 1.0, num=ppg_values.size, dtype=np.float32)
+        dst_x = np.linspace(0.0, 1.0, num=clip_len, dtype=np.float32)
+        return np.interp(dst_x, src_x, ppg_values.astype(np.float32)).astype(np.float32)
+
+    # Ensure monotonic timestamps for interpolation.
+    order = np.argsort(ppg_times)
+    ts = ppg_times[order].astype(np.float32)
+    sig = ppg_values[order].astype(np.float32)
+    return np.interp(frame_times, ts, sig).astype(np.float32)
+
+
+
+def _find_ubfc_phys_roots(subject_dir: Path) -> list[Path]:
+    """Return candidate roots for UBFC-Phys files (handles s1/s1 nested extraction)."""
+    roots = [subject_dir]
+    nested = [p for p in subject_dir.iterdir() if p.is_dir()]
+    if len(nested) == 1 and nested[0].name.lower() == subject_dir.name.lower():
+        roots.append(nested[0])
+    return roots
+
+
+def _extract_clip_ppg_normalized(ppg_values: np.ndarray, start: int, clip_len: int, total_frames: int) -> np.ndarray:
+    """Resample PPG to the clip frame window using normalized timeline [0, 1]."""
+    if ppg_values.size == 0:
+        return np.zeros((clip_len,), dtype=np.float32)
+    src_x = np.linspace(0.0, 1.0, num=ppg_values.size, dtype=np.float32)
+    denom = max(1, total_frames - 1)
+    dst_x = (start + np.arange(clip_len, dtype=np.float32)) / float(denom)
+    dst_x = np.clip(dst_x, 0.0, 1.0)
+    return np.interp(dst_x, src_x, ppg_values.astype(np.float32)).astype(np.float32)
+
+
+def _save_clip_payloads(
+    clips: np.ndarray,
+    out_dir: Path,
+    clip_prefix: str,
+    fps: float,
+    roi: str,
+    bbox,
+    stride: int,
+    clip_len: int,
+    ppg: np.ndarray,
+    hr: np.ndarray | None = None,
+    t: np.ndarray | None = None,
+) -> int:
+    saved = 0
+    out_dir.mkdir(parents=True, exist_ok=True)
+    total_frames = int((clips.shape[0] - 1) * stride + clip_len)
+    for i in range(clips.shape[0]):
+        start = i * stride
+        if hr is not None and t is not None and hr.size > 0 and t.size > 0:
+            hr_val = compute_clip_hr(start, clip_len, fps, t, hr)
+            ppg_clip = extract_clip_ppg(start, clip_len, fps, t, ppg)
+        else:
+            hr_val = float(np.mean(ppg)) if ppg.size > 0 else 0.0
+            ppg_clip = _extract_clip_ppg_normalized(ppg, start, clip_len, total_frames)
+
+        tensor = torch.from_numpy(clips[i])
+        fn = out_dir / f"{clip_prefix}_clip_{i:04d}.pt"
+        payload = {
+            'clip': tensor,
+            'hr': float(hr_val),
+            'ppg': ppg_clip,
+            'fps': float(fps),
+            'roi_type': roi,
+            'roi_bbox': bbox,
+        }
+        torch.save(payload, fn)
+        saved += 1
+    return saved
+
 
 def process_subject(subject_dir: Path, out_dir: Path, clip_len: int = 128, stride: int = 8, img_size: int = 72,
-                    roi: str = 'bbox', roi_pad: float = 0.0, forehead_ratio: float = 0.20):
+                    roi: str = 'bbox', roi_pad: float = 0.0, forehead_ratio: float = 0.20,
+                    side_ratio: float = 0.20, bottom_ratio: float = 0.20,
+                    phys_bvp_norm: str = 'zscore'):
+    # Format A: UBFC-rPPG style (ground_truth.txt + vid.avi)
     gt_path = subject_dir / 'ground_truth.txt'
     video_path = None
-    for ext in ('.avi'):
+    for ext in ('.avi',):
         candidate = subject_dir / f'vid{ext}'
         if candidate.exists():
             video_path = candidate
             break
     if video_path is None:
-        # fallback: pick any video file
         vids = list(subject_dir.glob('*.avi'))
         if vids:
             video_path = vids[0]
-    if not gt_path.exists() or video_path is None:
-        logger.info("Skipping %s, missing ground_truth or video", subject_dir)
+
+    if gt_path.exists() and video_path is not None:
+        ppg, hr, t = read_ground_truth(gt_path)
+        ppg = _zscore_signal(ppg)  # normalise to unit-std so joint training with UBFC-Phys stays on the same scale
+        frames, fps = extract_frames(video_path, img_size)
+        frames, bbox = transform_frames_with_roi(
+            frames,
+            roi=roi,
+            size=img_size,
+            pad=roi_pad,
+            forehead_ratio=forehead_ratio,
+            side_ratio=side_ratio,
+            bottom_ratio=bottom_ratio,
+        )
+        clips = make_clips(frames, clip_len=clip_len, stride=stride)
+        return _save_clip_payloads(
+            clips=clips,
+            out_dir=out_dir,
+            clip_prefix=subject_dir.name,
+            fps=fps,
+            roi=roi,
+            bbox=bbox,
+            stride=stride,
+            clip_len=clip_len,
+            ppg=ppg,
+            hr=hr,
+            t=t,
+        )
+
+    # Format B: UBFC-Phys style (vid_sX_TY.avi + bvp_sX_TY.csv)
+    phys_sessions: list[tuple[Path, Path, str]] = []
+    for base in _find_ubfc_phys_roots(subject_dir):
+        for vid in sorted(base.glob('vid_*.avi')):
+            suffix = vid.stem[len('vid_'):]
+            bvp = base / f'bvp_{suffix}.csv'
+            if bvp.exists():
+                phys_sessions.append((vid, bvp, suffix))
+
+    if not phys_sessions:
+        logger.info("Skipping %s, unsupported structure (missing UBFC-rPPG or UBFC-Phys file pairs)", subject_dir)
         return 0
 
-    ppg, hr, t = read_ground_truth(gt_path)
-    frames, fps = extract_frames(video_path, img_size)
-    frames, bbox = transform_frames_with_roi(frames, roi=roi, size=img_size, pad=roi_pad, forehead_ratio=forehead_ratio)
-    clips = make_clips(frames, clip_len=clip_len, stride=stride)
-    saved = 0
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for i in range(clips.shape[0]):
-        start = i * stride
-        hr_val = compute_clip_hr(start, clip_len, fps, t, hr)
-        tensor = torch.from_numpy(clips[i])
-        fn = out_dir / f"{subject_dir.name}_clip_{i:04d}.pt"
-        payload = {'clip': tensor, 'hr': float(hr_val), 'roi_type': roi, 'roi_bbox': bbox}
-        torch.save(payload, fn)
-        saved += 1
-    return saved
+    total_saved = 0
+    for vid, bvp_path, suffix in phys_sessions:
+        try:
+            ppg = np.loadtxt(bvp_path, delimiter=',', dtype=np.float32)
+            ppg = np.asarray(ppg, dtype=np.float32).squeeze()
+            if ppg.ndim == 0:
+                ppg = np.array([float(ppg)], dtype=np.float32)
+            if phys_bvp_norm == 'zscore':
+                ppg = _zscore_signal(ppg)
+        except Exception as e:
+            logger.warning("Skipping session %s due to unreadable BVP csv: %s", bvp_path, e)
+            continue
+
+        frames, fps = extract_frames(vid, img_size)
+        frames, bbox = transform_frames_with_roi(
+            frames,
+            roi=roi,
+            size=img_size,
+            pad=roi_pad,
+            forehead_ratio=forehead_ratio,
+            side_ratio=side_ratio,
+            bottom_ratio=bottom_ratio,
+        )
+        clips = make_clips(frames, clip_len=clip_len, stride=stride)
+
+        clip_prefix = f"{subject_dir.name}_{suffix}"
+        total_saved += _save_clip_payloads(
+            clips=clips,
+            out_dir=out_dir,
+            clip_prefix=clip_prefix,
+            fps=fps,
+            roi=roi,
+            bbox=bbox,
+            stride=stride,
+            clip_len=clip_len,
+            ppg=ppg,
+            hr=None,
+            t=None,
+        )
+    return total_saved
 
 
 def main():
@@ -117,16 +281,36 @@ def main():
     parser.add_argument('--roi_pad', type=float, default=0.0, help='Extra padding ratio applied to detected bbox')
     parser.add_argument('--forehead_ratio', type=float, default=0.20,
                         help='Extra top expansion ratio for bbox ROI (relative to face-box height). Set 0 to disable.')
+    parser.add_argument('--side_ratio', type=float, default=0.20,
+                        help='Extra left/right expansion ratio for ROI (relative to face-box width).')
+    parser.add_argument('--bottom_ratio', type=float, default=0.20,
+                        help='Extra bottom expansion ratio for ROI (relative to face-box height).')
+    parser.add_argument('--phys_bvp_norm', type=str, default='zscore', choices=['none', 'zscore'],
+                        help='Normalization applied only to UBFC-Phys BVP before saving as ppg.')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose debug logs')
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s:%(name)s: %(message)s')
+    else:
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(name)s: %(message)s')
+
     src = Path(args.src)
     out = Path(args.out)
     subjects = [p for p in src.iterdir() if p.is_dir()]
+    logger.info('Found %d subject folders under %s', len(subjects), src)
+
     total = 0
-    for s in subjects:
+    iterator = tqdm(subjects, desc='Preprocessing UBFC', unit='subject') if tqdm is not None else subjects
+    for s in iterator:
         n = process_subject(s, out, clip_len=args.clip_len, stride=args.stride, img_size=args.size,
-                            roi=args.roi, roi_pad=args.roi_pad, forehead_ratio=args.forehead_ratio)
+                            roi=args.roi, roi_pad=args.roi_pad, forehead_ratio=args.forehead_ratio,
+                            side_ratio=args.side_ratio, bottom_ratio=args.bottom_ratio,
+                            phys_bvp_norm=args.phys_bvp_norm)
         logger.info("Processed %s: %d clips", s.name, n)
         total += n
+        if tqdm is not None:
+            iterator.set_postfix_str(f'latest={s.name}:{n}, total={total}')
     logger.info("Total clips saved: %d", total)
 
 

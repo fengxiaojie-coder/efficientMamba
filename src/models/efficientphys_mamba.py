@@ -18,9 +18,22 @@ from torch import Tensor, nn
 
 
 try:
-    from mamba_ssm import Mamba
-except Exception:  # pragma: no cover - optional dependency
-    Mamba = None
+    # Prefer the lightweight core module to avoid pulling optional NLP deps
+    # from mamba_ssm.__init__ (transformers/sklearn/scipy).
+    from mamba_ssm.modules.mamba_simple import Mamba
+    _MAMBA_IMPORT_ERROR: str | None = None
+except Exception as e_core:  # pragma: no cover - optional dependency
+    try:
+        # Fallback for alternate package layouts.
+        from mamba_ssm import Mamba
+        _MAMBA_IMPORT_ERROR = None
+    except Exception as e_top:  # pragma: no cover - optional dependency
+        Mamba = None
+        _MAMBA_IMPORT_ERROR = (
+            'mamba_ssm import failed. '
+            f'core_error={type(e_core).__name__}: {e_core}; '
+            f'top_error={type(e_top).__name__}: {e_top}'
+        )
 
 # import the faithful EfficientPhys front-end if available in this package
 from .efficientphys_front import EfficientPhysFront
@@ -147,16 +160,24 @@ class TemporalBackbone(nn.Module):
         return self.norm(x)
 
 
+def mamba_backend_status() -> tuple[bool, str]:
+    """Return whether mamba backend is available and a short reason."""
+    if Mamba is not None:
+        return True, 'mamba_ssm import OK'
+    if _MAMBA_IMPORT_ERROR is not None:
+        return False, _MAMBA_IMPORT_ERROR
+    return False, 'mamba_ssm unavailable'
+
+
 class EfficientPhysMambaRegressor(nn.Module):
-    """End-to-end fusion model for rPPG / HR regression."""
+    """End-to-end fusion model for PPG waveform prediction.
+
+    Predicts per-frame PPG values (rPPG) from video, outputting [B, T, 1].
+    """
 
     def __init__(self, in_channels: int = 6, embed_dim: int = 128, d_state: int = 16, d_conv: int = 4,
                  use_mamba: bool = True, img_size: int = 72, frame_depth: int = 128):
         super().__init__()
-        # use the faithful EfficientPhys front to produce the d10 embedding
-        # note: EfficientPhysFront accepts total per-frame channels (6 for
-        # motion+appearance). It also supports 3-channel inputs by internal
-        # duplication for compatibility.
         self.feature_extractor = EfficientPhysFront(
             in_channels=in_channels,
             nb_dense=embed_dim,
@@ -164,6 +185,7 @@ class EfficientPhysMambaRegressor(nn.Module):
             frame_depth=frame_depth,
         )
         self.temporal = TemporalBackbone(d_model=embed_dim, d_state=d_state, d_conv=d_conv, use_mamba=use_mamba)
+        # Per-frame PPG prediction head: [B,T,D] -> [B,T,1]
         self.head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 2),
             nn.ReLU(inplace=True),
@@ -184,9 +206,12 @@ class EfficientPhysMambaRegressor(nn.Module):
             features = result
             attn_dict = None
 
-        temporal_features = self.temporal(features)
-        pooled = temporal_features.mean(dim=1)
-        output = self.head(pooled)
+        temporal_features = self.temporal(features)  # [B, T, D]
+        # Apply per-frame head: [B, T, D] -> [B, T, 1]
+        B, T, D = temporal_features.shape
+        flat = temporal_features.reshape(B * T, D)  # [B*T, D]
+        ppg_pred = self.head(flat)  # [B*T, 1]
+        output = ppg_pred.view(B, T, 1)  # [B, T, 1]
 
         if return_attention:
             return output, attn_dict

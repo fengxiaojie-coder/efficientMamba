@@ -118,6 +118,27 @@ class EfficientPhysFront(nn.Module):
         else:
             raise Exception('Unsupported image size')
 
+        # Initialize weights: G1 and G2 attention conv weights smaller to avoid early saturation
+        # This helps both gates learn gradients evenly instead of one dominating
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+        # Special: initialize attention gate conv layers (G1, G2) with smaller variance
+        # This prevents early saturation of sigmoid output and helps both gates learn
+        nn.init.xavier_uniform_(self.apperance_att_conv1.weight, gain=0.1)
+        if self.apperance_att_conv1.bias is not None:
+            nn.init.constant_(self.apperance_att_conv1.bias, 0)
+        nn.init.xavier_uniform_(self.apperance_att_conv2.weight, gain=0.1)
+        if self.apperance_att_conv2.bias is not None:
+            nn.init.constant_(self.apperance_att_conv2.bias, 0)
+
     def forward_features(self, frames: Tensor, roi_map: Optional[Tensor] = None, return_attention: bool = False) -> Tensor | tuple[Tensor, dict]:
         """Compute embeddings from a video clip.
 
@@ -163,14 +184,9 @@ class EfficientPhysFront(nn.Module):
 
         # gating 1
         g1_raw = torch.sigmoid(self.apperance_att_conv1(r2))
-        # prepare roi map expanded to nt if provided (resize to g1 spatial size)
-        roi_map_nt1 = None
-        if roi_map is not None:
-            B_tmp, T_tmp = frames.shape[0], frames.shape[1]
-            _, _, H1, W1 = g1_raw.shape
-            roi_resized1 = torch.nn.functional.interpolate(roi_map, size=(H1, W1), mode='bilinear', align_corners=False)
-            roi_map_nt1 = roi_resized1.unsqueeze(1).expand(-1, T_tmp, -1, -1, -1).reshape(-1, 1, H1, W1)
-        g1 = self.attn_mask_1(g1_raw, roi_map=roi_map_nt1)
+        # G1 operates without ROI constraint to learn background suppression independently
+        # (only G2 uses ROI prior to enforce facial region focus)
+        g1 = self.attn_mask_1(g1_raw, roi_map=None)
         gated1 = d2 * g1
 
         d3 = self.avg_pooling_1(gated1)

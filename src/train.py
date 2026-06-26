@@ -1,4 +1,4 @@
-"""Training script for EfficientMamba.
+"""Training script for EfficientMamba PPG waveform prediction.
 
 Usage (quick run):
     python -m src.train --clips_dir data/ubfc_clips --epochs 2 --batch_size 4 --max_samples 200
@@ -9,6 +9,8 @@ import argparse
 import random
 from pathlib import Path
 import time
+from collections import Counter
+import numpy as np
 try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:
@@ -23,7 +25,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from src.datasets.ubfc_dataset import UBFCClipDataset
-from src.models.efficientphys_mamba import EfficientPhysMambaRegressor
+from src.models.efficientphys_mamba import EfficientPhysMambaRegressor, mamba_backend_status
 
 # optional fast progress bars; fallback to no-op if tqdm not installed
 try:
@@ -32,6 +34,24 @@ except Exception:
     def tqdm(x, **kwargs):
         return x
 import csv
+
+
+def _sample_clip_temporal_lengths(clip_roots: list[Path], max_files: int = 256) -> dict[int, int]:
+    """Return a sampled histogram of clip temporal lengths across clip roots."""
+    counts: Counter[int] = Counter()
+    inspected = 0
+    for root in clip_roots:
+        for fn in sorted(root.glob('**/*.pt')):
+            if inspected >= max_files:
+                return dict(sorted(counts.items()))
+            try:
+                d = torch.load(fn, weights_only=False)
+                t = int(d['clip'].shape[0])
+                counts[t] += 1
+                inspected += 1
+            except Exception:
+                continue
+    return dict(sorted(counts.items()))
 
 
 def _neg_pearson_loss(preds: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -44,7 +64,22 @@ def _neg_pearson_loss(preds: torch.Tensor, target: torch.Tensor, eps: float = 1e
     if torch.isfinite(denom) and float(denom.item()) > eps:
         r = torch.sum(x * y) / denom
         return 1.0 - r
-    return preds.new_tensor(0.0)
+    # If variance is near zero, predictions are effectively constant.
+    # Returning 0 here creates a dead-zone where Pearson provides no gradient signal.
+    # Use a fixed penalty so the model is pushed away from collapsed outputs.
+    return preds.new_tensor(1.0)
+
+
+def _pearson_corr(preds: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> float:
+    """Return Pearson correlation coefficient r for the flattened tensors."""
+    x = preds.reshape(-1)
+    y = target.reshape(-1)
+    x = x - torch.mean(x)
+    y = y - torch.mean(y)
+    denom = torch.sqrt(torch.sum(x * x) * torch.sum(y * y) + eps)
+    if not torch.isfinite(denom) or float(denom.item()) <= eps:
+        return float('nan')
+    return float((torch.sum(x * y) / denom).item())
 
 
 def _build_roi_map(clips, roi_types, device):
@@ -168,7 +203,7 @@ def train_epoch(
     loss_fn,
     device,
     neg_pearson_coef: float = 0.0,
-    mae_coef: float = 1.0,
+    mae_coef: float = 1.0,  # reserved for backward compatibility
     desc: str | None = None,
     epoch: int = 0,
     save_dir: Path | None = None,
@@ -177,28 +212,45 @@ def train_epoch(
     model.train()
     total_loss = 0.0
     count = 0
+    pearson_sum = 0.0
+    pearson_count = 0
     iterator = tqdm(loader, desc=desc, leave=False)
     for step, batch in enumerate(iterator, start=1):
-        # support datasets that may return ROI metadata: (clips, hrs[, roi_type, roi_bbox])
+        # support datasets that may return ROI metadata: (clips, ppg_waveform[, roi_type, roi_bbox])
         if isinstance(batch, (list, tuple)) and len(batch) >= 2:
             clips = batch[0]
-            hrs = batch[1]
+            ppg = batch[1]  # PPG waveform [B, T] - real ground truth
             roi_types = batch[2] if len(batch) > 2 else None
         else:
-            clips, hrs = batch
+            clips, ppg = batch
             roi_types = None
 
-        clips = clips.to(device)
-        hrs = hrs.to(device).unsqueeze(1)
+        clips = clips.to(device)  # [B, T, 6, H, W]
+        ppg = ppg.to(device)  # [B, T]
+
+        # Reshape PPG to match model output: [B, T] -> [B, T, 1]
+        if ppg.dim() == 1:
+            ppg = ppg.unsqueeze(0).unsqueeze(-1)  # [T] -> [1, T, 1]
+        elif ppg.dim() == 2:
+            ppg = ppg.unsqueeze(-1)  # [B, T] -> [B, T, 1]
 
         # build a simple centered Gaussian ROI map per-sample when explicit ROI was used
         roi_map = _build_roi_map(clips, roi_types, device)
 
         optimizer.zero_grad()
-        preds = model(clips, roi_map=roi_map) if roi_map is not None else model(clips)
-        loss = float(mae_coef) * loss_fn(preds, hrs)
-        if neg_pearson_coef > 0.0:
-            loss = loss + float(neg_pearson_coef) * _neg_pearson_loss(preds, hrs)
+        preds = model(clips, roi_map=roi_map) if roi_map is not None else model(clips)  # [B, T, 1]
+
+        # Optimize the same objective users configure: base loss + optional Pearson penalty.
+        base_loss = loss_fn(preds, ppg)
+        if float(neg_pearson_coef) > 0.0:
+            pearson_penalty = _neg_pearson_loss(preds, ppg)
+            loss = base_loss + float(neg_pearson_coef) * pearson_penalty
+        else:
+            loss = base_loss
+        batch_pearson = _pearson_corr(preds.detach(), ppg.detach())
+        if np.isfinite(batch_pearson):
+            pearson_sum += batch_pearson * clips.size(0)
+            pearson_count += clips.size(0)
         loss.backward()
         grad_norm = _compute_grad_norm(model)
         optimizer.step()
@@ -222,7 +274,7 @@ def train_epoch(
                 step=step,
                 clips=clips,
                 preds=preds,
-                hrs=hrs,
+                hrs=ppg,  # Now ppg waveform, not scalar HR
                 loss_value=float(loss.item()),
                 grad_norm=float(grad_norm),
                 attn_dict=attn_dict,
@@ -230,14 +282,24 @@ def train_epoch(
 
         total_loss += loss.item() * clips.size(0)
         count += clips.size(0)
-    return total_loss / max(1, count)
+    return total_loss / max(1, count), (pearson_sum / max(1, pearson_count) if pearson_count > 0 else float('nan'))
 
 
-def eval_model(model, loader, device, desc: str | None = None, max_batches: int = 0):
+def eval_model(
+    model,
+    loader,
+    device,
+    desc: str | None = None,
+    max_batches: int = 0,
+    loss_fn: nn.Module | None = None,
+    neg_pearson_coef: float = 0.0,
+):
     model.eval()
     import numpy as np
     preds_all = []
-    hrs_all = []
+    ppgs_all = []
+    eval_loss_sum = 0.0
+    eval_count = 0
     with torch.no_grad():
         iterator = tqdm(loader, desc=desc, leave=False)
         for batch_idx, batch in enumerate(iterator):
@@ -245,13 +307,16 @@ def eval_model(model, loader, device, desc: str | None = None, max_batches: int 
                 break
             if isinstance(batch, (list, tuple)) and len(batch) >= 2:
                 clips = batch[0]
-                hrs = batch[1]
+                ppg = batch[1]  # PPG waveform [B, T]
                 roi_types = batch[2] if len(batch) > 2 else None
             else:
-                clips, hrs = batch
+                clips, ppg = batch
                 roi_types = None
 
             clips = clips.to(device)
+            if ppg.dim() == 2:
+                ppg = ppg.unsqueeze(-1)  # [B, T] -> [B, T, 1]
+            ppg = ppg.to(device)
 
             roi_map = None
             if roi_types is not None:
@@ -275,23 +340,41 @@ def eval_model(model, loader, device, desc: str | None = None, max_batches: int 
                 except Exception:
                     roi_map = None
 
-            out = model(clips, roi_map=roi_map) if roi_map is not None else model(clips)
+            out = model(clips, roi_map=roi_map) if roi_map is not None else model(clips)  # [B, T, 1]
             preds_all.append(out.cpu().numpy())
-            hrs_all.append(hrs.numpy())
+            ppgs_all.append(ppg.cpu().numpy())
+            if loss_fn is not None:
+                base_loss = loss_fn(out, ppg)
+                if float(neg_pearson_coef) > 0.0:
+                    batch_loss = base_loss + float(neg_pearson_coef) * _neg_pearson_loss(out, ppg)
+                else:
+                    batch_loss = base_loss
+                eval_loss_sum += float(batch_loss.item()) * clips.size(0)
+                eval_count += clips.size(0)
     if not preds_all:
-        return float('nan'), {'pred_mean': float('nan'), 'pred_std': float('nan'), 'pred_min': float('nan'), 'pred_max': float('nan'), 'true_mean': float('nan'), 'true_std': float('nan')}
-    preds = np.vstack(preds_all).ravel()
-    hrs = np.hstack(hrs_all).ravel()
-    mae = float(np.mean(np.abs(preds - hrs)))
+        return float('nan'), {
+            'pred_mean': float('nan'),
+            'pred_std': float('nan'),
+            'pred_min': float('nan'),
+            'pred_max': float('nan'),
+            'true_mean': float('nan'),
+            'true_std': float('nan'),
+        }, float('nan')
+    preds = np.vstack(preds_all).squeeze()  # [N, T] after squeeze
+    ppgs = np.vstack(ppgs_all).squeeze()   # [N, T] after squeeze
+    # Compute frame-wise MSE
+    mse = float(np.mean((preds - ppgs) ** 2))
     pred_stats = {
         'pred_mean': float(np.mean(preds)),
         'pred_std': float(np.std(preds)),
         'pred_min': float(np.min(preds)),
         'pred_max': float(np.max(preds)),
-        'true_mean': float(np.mean(hrs)),
-        'true_std': float(np.std(hrs)),
+        'true_mean': float(np.mean(ppgs)),
+        'true_std': float(np.std(ppgs)),
     }
-    return mae, pred_stats
+    pearson = float(np.corrcoef(preds.reshape(-1), ppgs.reshape(-1))[0, 1]) if preds.size > 1 and ppgs.size > 1 else float('nan')
+    eval_loss = float(eval_loss_sum / max(1, eval_count)) if loss_fn is not None else float('nan')
+    return mse, pred_stats, eval_loss, pearson
 
 
 def main():
@@ -303,6 +386,8 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--clips_dir', default='data/ubfc_clips')
+    parser.add_argument('--extra_clips_dirs', type=str, default='',
+                        help='Comma-separated extra clip directories to merge into training (e.g. data/ubfc_phys_clips,data/other_clips)')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose (DEBUG) logging')
     parser.add_argument('--epochs', type=int, default=3)
     parser.add_argument('--batch_size', type=int, default=8)
@@ -313,12 +398,14 @@ def main():
                         help='Weight decay for AdamW. Lower values can help avoid mean-collapse.')
     parser.add_argument('--no_augment', action='store_true',
                         help='Disable training-time augmentation for debugging collapse issues')
-    parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'huber'],
-                        help='Regression loss type')
+    parser.add_argument('--loss', type=str, default='negative_pearson', choices=['mse', 'huber', 'negative_pearson'],
+                        help='Base loss type: mse/huber or negative_pearson (EfficientPhys-style)')
     parser.add_argument('--huber_delta', type=float, default=3.0,
                         help='Delta used when --loss huber')
     parser.add_argument('--neg_pearson_coef', type=float, default=0.1,
                         help='Add negative Pearson term: total_loss = base_loss + coef * (1-r), where r is batch Pearson corr')
+    parser.add_argument('--early_stopping_patience', type=int, default=0,
+                        help='Stop training if val_pearson does not improve for N epochs. Set to 0 to disable.')
     parser.add_argument('--two_stage_training', action='store_true',
                         help='Enable two-stage training: stage1 (light MAE, heavy Pearson) then stage2 (full MAE+Pearson)')
     parser.add_argument('--stage1_epochs', type=int, default=10,
@@ -339,6 +426,8 @@ def main():
     parser.add_argument('--split_mode', type=str, default='clip_random',
                         choices=['clip_random', 'subject_disjoint'],
                         help='How to split train/val: random by clip, or disjoint by subject')
+    parser.add_argument('--temporal_backbone', type=str, default='auto', choices=['auto', 'mamba', 'gru'],
+                        help='Temporal model selection: auto=prefer mamba with GRU fallback, mamba=fail if unavailable, gru=force GRU')
     parser.add_argument('--debug_viz_every_steps', type=int, default=0,
                         help='If >0, save quick debug visualizations every N training steps to checkpoints/debug_steps')
     parser.add_argument('--train_eval_batches', type=int, default=10,
@@ -367,11 +456,49 @@ def main():
         default_min_lr,
     )
 
-    ds = UBFCClipDataset(args.clips_dir, frame_depth=args.frame_depth)
+    clip_roots = [Path(args.clips_dir)]
+    if args.extra_clips_dirs:
+        extra_dirs = [Path(p.strip()) for p in args.extra_clips_dirs.split(',') if p.strip()]
+        clip_roots.extend(extra_dirs)
+    for root in clip_roots:
+        if not root.exists():
+            raise SystemExit(f'Clip directory does not exist: {root}')
+
+    ds = UBFCClipDataset(clip_roots[0], frame_depth=args.frame_depth)
+    merged_files = list(ds.files)
+    for root in clip_roots[1:]:
+        extra_ds = UBFCClipDataset(root, frame_depth=args.frame_depth)
+        merged_files.extend(extra_ds.files)
+    ds.files = sorted(merged_files)
+    logger.info('Loaded %d clips from %d directory(ies): %s', len(ds.files), len(clip_roots), [str(p) for p in clip_roots])
+    if len(ds.files) == 0:
+        # Provide actionable mismatch hints when all clips are filtered by frame_depth.
+        t_hist = _sample_clip_temporal_lengths(clip_roots, max_files=256)
+        if t_hist:
+            t_values = list(t_hist.keys())
+            suggested = max(t_hist.items(), key=lambda kv: kv[1])[0]
+            raise SystemExit(
+                'No clips found after frame_depth filtering. '
+                f'Current --frame_depth={args.frame_depth}, sampled clip T distribution={t_hist}. '
+                f'Try --frame_depth {suggested} (or re-run preprocessing with --clip_len {args.frame_depth}).'
+            )
+
     # Subject-aware selection
     def subject_from_name(fn: Path) -> str:
         name = fn.name
-        return name.split('_clip_', 1)[0] if '_clip_' in name else name
+        base_subject = name.split('_clip_', 1)[0] if '_clip_' in name else name
+        try:
+            fn_resolved = fn.resolve()
+            for root in clip_roots:
+                root_resolved = root.resolve()
+                try:
+                    fn_resolved.relative_to(root_resolved)
+                    return f'{root_resolved.name}::{base_subject}'
+                except ValueError:
+                    continue
+        except Exception:
+            pass
+        return base_subject
 
     # Build subject -> files mapping
     subj_map: dict = {}
@@ -405,7 +532,7 @@ def main():
     ds.files = filtered_files
     n = len(ds)
     if n == 0:
-        raise SystemExit('No clips found. Run preprocessing first.')
+        raise SystemExit('No clips found after subject/sample filtering. Check --subjects/--max_subjects/--per_subject_limit settings.')
     # split (manual so we can enable augment only for training set)
     if args.split_mode == 'clip_random':
         # shuffle and split by clip
@@ -465,8 +592,31 @@ def main():
     else:
         val_loader = None
 
-    model = EfficientPhysMambaRegressor(in_channels=6, frame_depth=args.frame_depth)
+    use_mamba_requested = args.temporal_backbone != 'gru'
+    model = EfficientPhysMambaRegressor(in_channels=6, frame_depth=args.frame_depth, use_mamba=use_mamba_requested)
     model.to(device)
+
+    mamba_available, mamba_reason = mamba_backend_status()
+    if args.temporal_backbone == 'mamba' and not model.temporal.uses_mamba:
+        raise SystemExit(
+            'Requested --temporal_backbone mamba, but Mamba backend is unavailable. '
+            f'Reason: {mamba_reason}'
+        )
+
+    # Log model configuration
+    backbone_name = 'Mamba' if model.temporal.uses_mamba else 'GRU'
+    total_params = sum(p.numel() for p in model.parameters())
+    temporal_params = sum(p.numel() for p in model.temporal.parameters())
+    logger.info('=' * 70)
+    logger.info('Model Configuration')
+    logger.info('=' * 70)
+    logger.info('Architecture: EfficientPhysMambaRegressor')
+    logger.info('Temporal Backbone: %s (requested=%s, mamba_available=%s)', backbone_name, args.temporal_backbone, mamba_available)
+    logger.info('Frame depth: %d, Input channels: 6', args.frame_depth)
+    logger.info('Total parameters: %s', f'{total_params:,}')
+    logger.info('Temporal backbone parameters: %s (%.1f%%)', f'{temporal_params:,}', 100*temporal_params/total_params)
+    logger.info('Device: %s', device)
+    logger.info('=' * 70)
 
     optimizer = torch_optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch_optim.lr_scheduler.CosineAnnealingLR(
@@ -475,28 +625,45 @@ def main():
         eta_min=default_min_lr,
     )
     cosine_steps_done = 0
-    if args.loss == 'huber':
+    if args.loss == 'negative_pearson':
+        loss_fn = _neg_pearson_loss
+    elif args.loss == 'huber':
         loss_fn = nn.HuberLoss(delta=float(args.huber_delta))
     else:
         loss_fn = nn.MSELoss()
+
+    effective_neg_pearson_coef = float(args.neg_pearson_coef)
+    if args.loss == 'negative_pearson' and effective_neg_pearson_coef > 0.0:
+        logger.warning(
+            'Ignoring --neg_pearson_coef=%.3f because --loss=negative_pearson already optimizes (1-r) directly.',
+            effective_neg_pearson_coef,
+        )
+        effective_neg_pearson_coef = 0.0
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(save_dir / 'runs')) if SummaryWriter is not None else None
 
-    best_val = float('inf')
+    best_val = float('-inf')
     epochs_done = []
     train_losses = []
     train_maes = []
     val_maes = []
+    train_pearsons = []
+    val_pearsons = []
     train_pred_stds = []
     val_pred_stds = []
     metrics_csv = save_dir / 'training_metrics.csv'
     # write header
     with open(metrics_csv, 'w', newline='') as _f:
         w = csv.writer(_f)
-        w.writerow(['epoch', 'train_loss', 'train_mae', 'val_mae', 'train_pred_std', 'val_pred_std'])
-    for epoch in tqdm(range(1, args.epochs + 1), desc='Training', total=args.epochs, leave=True, ncols=100, force_tqdm=True):
+        w.writerow(['epoch', 'train_loss', 'train_mse', 'val_mse', 'val_loss', 'train_pearson', 'val_pearson', 'train_pred_std', 'val_pred_std'])
+
+    # Early stopping counter
+    patience_counter = 0
+    early_stopping_patience = int(args.early_stopping_patience) if hasattr(args, 'early_stopping_patience') else 15
+
+    for epoch in tqdm(range(1, args.epochs + 1), desc='Training', total=args.epochs, leave=True, ncols=100):
         current_lr = float(optimizer.param_groups[0]['lr'])
         t0 = time.time()
         if args.two_stage_training:
@@ -509,26 +676,43 @@ def main():
         else:
             mae_coef = 1.0
             stage_label = ''
-        train_loss = train_epoch(
+        train_loss, train_pearson = train_epoch(
             model,
             train_loader,
             optimizer,
             loss_fn,
             device,
-            neg_pearson_coef=float(args.neg_pearson_coef),
+            neg_pearson_coef=effective_neg_pearson_coef,
             mae_coef=mae_coef,
             epoch=epoch,
             save_dir=save_dir,
             debug_viz_every_steps=int(args.debug_viz_every_steps),
             desc=f'Epoch {epoch}/{args.epochs} {stage_label} [train]',
         )
-        # compute train MAE for monitoring (limited to train_eval_batches for speed)
-        train_mae, train_stats = eval_model(model, train_loader, device, max_batches=int(args.train_eval_batches), desc=f'Epoch {epoch}/{args.epochs} [train-eval]')
-        # compute val MAE if validation set exists
+        # compute train MSE for monitoring (limited to train_eval_batches for speed)
+        train_mse, train_stats, _train_eval_loss, train_eval_pearson = eval_model(
+            model,
+            train_loader,
+            device,
+            max_batches=int(args.train_eval_batches),
+            desc=f'Epoch {epoch}/{args.epochs} [train-eval]',
+            loss_fn=loss_fn,
+            neg_pearson_coef=effective_neg_pearson_coef,
+        )
+        # compute val metrics if validation set exists
         if val_loader is not None:
-            val_mae, val_stats = eval_model(model, val_loader, device, desc=f'Epoch {epoch}/{args.epochs} [val-eval]')
+            val_mse, val_stats, val_loss, val_pearson = eval_model(
+                model,
+                val_loader,
+                device,
+                desc=f'Epoch {epoch}/{args.epochs} [val-eval]',
+                loss_fn=loss_fn,
+                neg_pearson_coef=effective_neg_pearson_coef,
+            )
         else:
-            val_mae = float('nan')
+            val_mse = float('nan')
+            val_loss = float('nan')
+            val_pearson = float('nan')
             val_stats = {
                 'pred_std': float('nan'),
                 'pred_mean': float('nan'),
@@ -540,28 +724,33 @@ def main():
         t1 = time.time()
         if args.two_stage_training:
             logger.info(
-                'Epoch %d/%d [%s] - mae_coef=%.3f lr=%.2e train_loss=%.4f train_mae=%.4f val_mae=%.4f train_pred_std=%.4f val_pred_std=%.4f time=%.1fs',
+                'Epoch %d/%d [%s] - mae_coef=%.3f lr=%.2e train_loss=%.4f train_mse=%.4f val_mse=%.4f train_pearson=%.4f val_pearson=%.4f train_pred_std=%.4f val_pred_std=%.4f time=%.1fs',
                 epoch,
                 args.epochs,
                 stage_label,
                 mae_coef,
                 current_lr,
                 train_loss,
-                train_mae,
-                val_mae,
+                train_mse,
+                val_mse,
+                train_eval_pearson,
+                val_pearson,
                 train_stats['pred_std'],
                 val_stats['pred_std'],
                 t1 - t0,
             )
         else:
             logger.info(
-                'Epoch %d/%d - lr=%.2e train_loss=%.4f train_mae=%.4f val_mae=%.4f train_pred_std=%.4f val_pred_std=%.4f time=%.1fs',
+                'Epoch %d/%d - lr=%.2e train_loss=%.4f train_mse=%.4f val_mse=%.4f val_loss=%.4f train_pearson=%.4f val_pearson=%.4f train_pred_std=%.4f val_pred_std=%.4f time=%.1fs',
                 epoch,
                 args.epochs,
                 current_lr,
                 train_loss,
-                train_mae,
-                val_mae,
+                train_mse,
+                val_mse,
+                val_loss,
+                train_eval_pearson,
+                val_pearson,
                 train_stats['pred_std'],
                 val_stats['pred_std'],
                 t1 - t0,
@@ -580,28 +769,41 @@ def main():
             writer.add_scalar('train/loss', train_loss, epoch)
             writer.add_scalar('train/pred_std', train_stats['pred_std'], epoch)
             if val_loader is not None:
-                writer.add_scalar('val/mae', val_mae, epoch)
+                writer.add_scalar('val/mse', val_mse, epoch)
+                writer.add_scalar('val/loss', val_loss, epoch)
                 writer.add_scalar('val/pred_std', val_stats['pred_std'], epoch)
         ckpt = save_dir / f'model_epoch_{epoch}.pt'
         torch.save({'epoch': epoch, 'model_state': model.state_dict(), 'optim_state': optimizer.state_dict()}, ckpt)
-        # save best model only if we have a valid validation MAE
+        # save best model only if we have a valid validation Pearson
         try:
-            is_better = val_mae < best_val
+            is_better = np.isfinite(val_pearson) and (val_pearson > best_val)
         except Exception:
             is_better = False
         if is_better:
-            best_val = val_mae
+            best_val = val_pearson
+            patience_counter = 0  # Reset patience counter on improvement
             torch.save({'epoch': epoch, 'model_state': model.state_dict(), 'optim_state': optimizer.state_dict()}, save_dir / 'best.pt')
+            logger.info('📈 Best model saved at epoch %d (val_pearson=%.4f)', epoch, val_pearson)
+        else:
+            patience_counter += 1
+            if early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
+                logger.warning(
+                    '⏹️  Early stopping triggered: val_pearson did not improve for %d epochs. Best val_pearson=%.4f at epoch %d',
+                    early_stopping_patience, best_val, epoch - patience_counter
+                )
+                break
         # record metrics
         epochs_done.append(epoch)
         train_losses.append(train_loss)
-        train_maes.append(train_mae)
-        val_maes.append(val_mae)
+        train_maes.append(train_mse)
+        val_maes.append(val_mse)
+        train_pearsons.append(train_eval_pearson)
+        val_pearsons.append(val_pearson)
         train_pred_stds.append(train_stats['pred_std'])
         val_pred_stds.append(val_stats['pred_std'])
         with open(metrics_csv, 'a', newline='') as f:
             w = csv.writer(f)
-            w.writerow([epoch, train_loss, train_mae, val_mae, train_stats['pred_std'], val_stats['pred_std']])
+            w.writerow([epoch, train_loss, train_mse, val_mse, val_loss, train_eval_pearson, val_pearson, train_stats['pred_std'], val_stats['pred_std']])
 
         # try to save simple plots for quick visualization
         try:
@@ -618,15 +820,15 @@ def main():
             plt.close()
 
             plt.figure(figsize=(8, 4))
-            plt.plot(epochs_done, train_maes, label='train_mae')
-            plt.plot(epochs_done, val_maes, label='val_mae')
+            plt.plot(epochs_done, train_maes, label='train_mse')
+            plt.plot(epochs_done, val_maes, label='val_mse')
             plt.xlabel('epoch')
-            plt.ylabel('MAE (bpm)')
-            plt.title('MAE over epochs')
+            plt.ylabel('MSE (PPG)')
+            plt.title('PPG Waveform MSE over epochs')
             plt.legend()
             plt.grid(True)
             plt.tight_layout()
-            plt.savefig(save_dir / 'mae_epochs.png')
+            plt.savefig(save_dir / 'mse_epochs.png')
             plt.close()
         except Exception:
             logger.warning('Could not write training plots (matplotlib not available)')
