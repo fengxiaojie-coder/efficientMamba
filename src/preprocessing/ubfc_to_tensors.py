@@ -24,6 +24,13 @@ from src.preprocessing.roi_extract import transform_frames_with_roi
 
 logger = logging.getLogger(__name__)
 
+# Keep OpenCV single-threaded to reduce native decoder instability on shared servers.
+try:
+    cv2.setNumThreads(1)
+    cv2.ocl.setUseOpenCL(False)
+except Exception:
+    pass
+
 
 def _zscore_signal(sig: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     sig = np.asarray(sig, dtype=np.float32).squeeze()
@@ -36,20 +43,47 @@ def _zscore_signal(sig: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     return ((sig - mean) / std).astype(np.float32)
 
 
-def extract_frames(video_path: Path, img_size: int) -> Tuple[np.ndarray, float]:
+def extract_frames(video_path: Path, img_size: int, decoder: str = 'auto') -> Tuple[np.ndarray, float]:
+    # Prefer torchvision decoder first. It avoids some OpenCV/ffmpeg crashes seen on HPC nodes.
+    if decoder in ('auto', 'torchvision'):
+        try:
+            import torchvision
+            video, _, info = torchvision.io.read_video(str(video_path), pts_unit='sec')
+            if video is not None and int(video.shape[0]) > 0:
+                fps = float(info.get('video_fps', 30.0) or 30.0)
+                # read_video returns RGB uint8 tensor [T, H, W, C]
+                frames = video.numpy()
+                return frames, fps
+            if decoder == 'torchvision':
+                raise RuntimeError(f'torchvision decoder returned empty video for: {video_path}')
+        except Exception as e:
+            if decoder == 'torchvision':
+                raise RuntimeError(
+                    f'torchvision decoder failed for {video_path}. '
+                    'Install `av` (pip install av) and retry, or use --decoder auto/opencv.'
+                ) from e
+            logger.warning('torchvision video decode failed for %s, fallback to cv2: %s', video_path, e)
+
+    if decoder == 'torchvision':
+        raise RuntimeError(f'torchvision decoder failed for {video_path} and cv2 fallback is disabled')
+
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     frames = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        # keep original frame size here; resizing / cropping handled later
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frames.append(frame)
-    cap.release()
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            # keep original frame size here; resizing / cropping handled later
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(frame)
+    finally:
+        cap.release()
+    if not frames:
+        raise RuntimeError(f"No frames decoded from video: {video_path}")
     frames = np.stack(frames, axis=0)  # (N,H,W,3)
     return frames, fps
 
@@ -172,7 +206,12 @@ def _save_clip_payloads(
 def process_subject(subject_dir: Path, out_dir: Path, clip_len: int = 128, stride: int = 8, img_size: int = 72,
                     roi: str = 'bbox', roi_pad: float = 0.0, forehead_ratio: float = 0.20,
                     side_ratio: float = 0.20, bottom_ratio: float = 0.20,
-                    phys_bvp_norm: str = 'zscore'):
+                    phys_bvp_norm: str = 'zscore', decoder: str = 'auto',
+                    align_nose_axis: bool = False,
+                    face_mesh_first_frame_mask: bool = False,
+                    center_face: bool = False,
+                    canonical_face_mask: bool = False,
+                    frame_independent_face_mesh: bool = False):
     # Format A: UBFC-rPPG style (ground_truth.txt + vid.avi)
     gt_path = subject_dir / 'ground_truth.txt'
     video_path = None
@@ -189,7 +228,7 @@ def process_subject(subject_dir: Path, out_dir: Path, clip_len: int = 128, strid
     if gt_path.exists() and video_path is not None:
         ppg, hr, t = read_ground_truth(gt_path)
         ppg = _zscore_signal(ppg)  # normalise to unit-std so joint training with UBFC-Phys stays on the same scale
-        frames, fps = extract_frames(video_path, img_size)
+        frames, fps = extract_frames(video_path, img_size, decoder=decoder)
         frames, bbox = transform_frames_with_roi(
             frames,
             roi=roi,
@@ -198,6 +237,11 @@ def process_subject(subject_dir: Path, out_dir: Path, clip_len: int = 128, strid
             forehead_ratio=forehead_ratio,
             side_ratio=side_ratio,
             bottom_ratio=bottom_ratio,
+            align_nose_axis=align_nose_axis,
+            face_mesh_first_frame_mask=face_mesh_first_frame_mask,
+            center_face=center_face,
+            canonical_face_mask=canonical_face_mask,
+            frame_independent_face_mesh=frame_independent_face_mesh,
         )
         clips = make_clips(frames, clip_len=clip_len, stride=stride)
         return _save_clip_payloads(
@@ -240,7 +284,7 @@ def process_subject(subject_dir: Path, out_dir: Path, clip_len: int = 128, strid
             logger.warning("Skipping session %s due to unreadable BVP csv: %s", bvp_path, e)
             continue
 
-        frames, fps = extract_frames(vid, img_size)
+        frames, fps = extract_frames(vid, img_size, decoder=decoder)
         frames, bbox = transform_frames_with_roi(
             frames,
             roi=roi,
@@ -249,6 +293,11 @@ def process_subject(subject_dir: Path, out_dir: Path, clip_len: int = 128, strid
             forehead_ratio=forehead_ratio,
             side_ratio=side_ratio,
             bottom_ratio=bottom_ratio,
+            align_nose_axis=align_nose_axis,
+            face_mesh_first_frame_mask=face_mesh_first_frame_mask,
+            center_face=center_face,
+            canonical_face_mask=canonical_face_mask,
+            frame_independent_face_mesh=frame_independent_face_mesh,
         )
         clips = make_clips(frames, clip_len=clip_len, stride=stride)
 
@@ -276,7 +325,7 @@ def main():
     parser.add_argument('--clip_len', type=int, default=128)
     parser.add_argument('--stride', type=int, default=8)
     parser.add_argument('--size', type=int, default=72)
-    parser.add_argument('--roi', type=str, default='bbox', choices=['full', 'haar', 'mediapipe', 'ellipse', 'bbox'],
+    parser.add_argument('--roi', type=str, default='bbox', choices=['full', 'haar', 'mediapipe', 'ellipse', 'bbox', 'face_mesh'],
                         help='ROI strategy: full frame, haar cascade, mediapipe bbox, ellipse, or compact bbox crop')
     parser.add_argument('--roi_pad', type=float, default=0.0, help='Extra padding ratio applied to detected bbox')
     parser.add_argument('--forehead_ratio', type=float, default=0.20,
@@ -287,6 +336,18 @@ def main():
                         help='Extra bottom expansion ratio for ROI (relative to face-box height).')
     parser.add_argument('--phys_bvp_norm', type=str, default='zscore', choices=['none', 'zscore'],
                         help='Normalization applied only to UBFC-Phys BVP before saving as ppg.')
+    parser.add_argument('--decoder', type=str, default='auto', choices=['auto', 'torchvision', 'opencv'],
+                        help='Video decode backend. Use torchvision to avoid cv2 decode crashes on some servers.')
+    parser.add_argument('--align_nose_axis', action='store_true',
+                        help='For face_mesh ROI: rotate each frame so the nose bridge axis is vertical.')
+    parser.add_argument('--face_mesh_first_frame_mask', action='store_true',
+                        help='For face_mesh ROI: detect polygon from first frame only and reuse for all frames.')
+    parser.add_argument('--center_face', action='store_true',
+                        help='For face_mesh ROI: translate the nose center to the image center after alignment.')
+    parser.add_argument('--canonical_face_mask', action='store_true',
+                        help='For face_mesh ROI: enable align_nose_axis + center_face + face_mesh_first_frame_mask together.')
+    parser.add_argument('--frame_independent_face_mesh', action='store_true',
+                        help='For face_mesh ROI: run per-frame independent detection/alignment (no cross-frame shared detector state).')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose debug logs')
     args = parser.parse_args()
 
@@ -306,7 +367,12 @@ def main():
         n = process_subject(s, out, clip_len=args.clip_len, stride=args.stride, img_size=args.size,
                             roi=args.roi, roi_pad=args.roi_pad, forehead_ratio=args.forehead_ratio,
                             side_ratio=args.side_ratio, bottom_ratio=args.bottom_ratio,
-                            phys_bvp_norm=args.phys_bvp_norm)
+                            phys_bvp_norm=args.phys_bvp_norm, decoder=args.decoder,
+                            align_nose_axis=args.align_nose_axis,
+                            face_mesh_first_frame_mask=args.face_mesh_first_frame_mask,
+                            center_face=args.center_face,
+                            canonical_face_mask=args.canonical_face_mask,
+                            frame_independent_face_mesh=args.frame_independent_face_mesh)
         logger.info("Processed %s: %d clips", s.name, n)
         total += n
         if tqdm is not None:

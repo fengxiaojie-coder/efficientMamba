@@ -393,6 +393,8 @@ def main():
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--frame_depth', type=int, default=128,
                         help='Temporal clip length expected by TSM front-end (should match preprocessing clip_len)')
+    parser.add_argument('--skip_frame_depth_check', action='store_true',
+                        help='Skip per-file frame-depth validation at dataset load for faster startup. Use only when all clips share the same T.')
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--weight_decay', type=float, default=default_weight_decay,
                         help='Weight decay for AdamW. Lower values can help avoid mean-collapse.')
@@ -464,10 +466,18 @@ def main():
         if not root.exists():
             raise SystemExit(f'Clip directory does not exist: {root}')
 
-    ds = UBFCClipDataset(clip_roots[0], frame_depth=args.frame_depth)
+    dataset_frame_depth = None if args.skip_frame_depth_check else args.frame_depth
+    if args.skip_frame_depth_check:
+        logger.warning(
+            'Skipping frame_depth validation during dataset indexing for speed. '
+            'Ensure all clips have T=%d, or DataLoader/model shape errors may occur.',
+            args.frame_depth,
+        )
+
+    ds = UBFCClipDataset(clip_roots[0], frame_depth=dataset_frame_depth)
     merged_files = list(ds.files)
     for root in clip_roots[1:]:
-        extra_ds = UBFCClipDataset(root, frame_depth=args.frame_depth)
+        extra_ds = UBFCClipDataset(root, frame_depth=dataset_frame_depth)
         merged_files.extend(extra_ds.files)
     ds.files = sorted(merged_files)
     logger.info('Loaded %d clips from %d directory(ies): %s', len(ds.files), len(clip_roots), [str(p) for p in clip_roots])
@@ -575,7 +585,7 @@ def main():
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
 
     # create dataset instances: enable augment only for training dataset
-    train_ds = UBFCClipDataset(args.clips_dir, augment=use_augment, frame_depth=args.frame_depth)
+    train_ds = UBFCClipDataset(args.clips_dir, augment=use_augment, frame_depth=dataset_frame_depth)
     train_ds.files = train_files
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4,
@@ -583,7 +593,7 @@ def main():
     )
 
     if len(val_files) > 0:
-        val_ds = UBFCClipDataset(args.clips_dir, augment=False, frame_depth=args.frame_depth)
+        val_ds = UBFCClipDataset(args.clips_dir, augment=False, frame_depth=dataset_frame_depth)
         val_ds.files = val_files
         val_loader = DataLoader(
             val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4,

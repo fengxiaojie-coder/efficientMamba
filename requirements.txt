@@ -4,7 +4,7 @@ pandas
 torch==2.7.0
 torchvision==0.22.0
 torchaudio==2.7.0
-numpy
+numpy==1.26.4
 scikit-learn
 transformers
 tiktoken
@@ -15,7 +15,7 @@ seaborn
 sentencepiece
 protobuf==3.20.3
 tensorboard
-mediapipe
+mediapipe==0.10.21
 # Cloud/GPU note:
 # This file targets a CUDA-enabled PyTorch wheel for cloud Linux environments.
 # If you need the optional Mamba backend, use requirements-mamba.txt instead.

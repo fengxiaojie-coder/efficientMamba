@@ -57,7 +57,7 @@ def main() -> None:
     parser.add_argument('--sample_dir', required=True, help='UBFC subject directory, e.g. dataSet/UBFC-rPPG/subject9')
     parser.add_argument('--out', default='results/pipeline_stages', help='Output directory')
     parser.add_argument('--size', type=int, default=72)
-    parser.add_argument('--roi', type=str, default='bbox', choices=['full', 'haar', 'mediapipe', 'ellipse', 'bbox'])
+    parser.add_argument('--roi', type=str, default='bbox', choices=['full', 'haar', 'mediapipe', 'ellipse', 'bbox', 'face_mesh'])
     parser.add_argument('--roi_pad', type=float, default=0.0)
     parser.add_argument('--forehead_ratio', type=float, default=0.20)
     parser.add_argument('--frame_index', type=int, default=20)
