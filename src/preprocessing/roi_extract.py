@@ -286,15 +286,28 @@ def detect_face_polygons_mediapipe(
     return_scale: bool = False,
 ) -> list[Optional[np.ndarray]] | tuple[list[Optional[np.ndarray]], list[Optional[tuple[float, float]]], list[Optional[float]]] | tuple[list[Optional[np.ndarray]], list[Optional[tuple[float, float]]], list[Optional[float]], list[Optional[float]]]:
     """Detect face contour polygon for each frame with temporal smoothing."""
+    empty_polys: list[Optional[np.ndarray]] = [None for _ in frames]
+    empty_centers: list[Optional[tuple[float, float]]] = [None for _ in frames]
+    empty_angles: list[Optional[float]] = [None for _ in frames]
+    empty_scales: list[Optional[float]] = [None for _ in frames]
+
     try:
         import mediapipe as mp
     except ImportError:
         logger.warning('mediapipe is not installed; face_mesh ROI unavailable')
-        return [None for _ in frames]
+        if return_alignment:
+            if return_scale:
+                return empty_polys, empty_centers, empty_angles, empty_scales
+            return empty_polys, empty_centers, empty_angles
+        return empty_polys
 
     if not hasattr(mp, 'solutions') or getattr(mp, 'solutions', None) is None:
         logger.warning('mediapipe package is present but missing solutions API; face_mesh ROI unavailable')
-        return [None for _ in frames]
+        if return_alignment:
+            if return_scale:
+                return empty_polys, empty_centers, empty_angles, empty_scales
+            return empty_polys, empty_centers, empty_angles
+        return empty_polys
 
     polys: list[Optional[np.ndarray]] = []
     align_centers: list[Optional[tuple[float, float]]] = []
@@ -365,8 +378,8 @@ def detect_face_polygons_mediapipe(
             # Roll alignment info: use eye-line as primary signal, nose-axis as fallback.
             p_top = lm[168]
             p_bottom = lm[6]
-            cx = float(lm[1].x * w)
-            cy = float(lm[1].y * h)
+            nose_cx = float(lm[1].x * w)
+            nose_cy = float(lm[1].y * h)
             dx = float((p_bottom.x - p_top.x) * w)
             dy = float((p_bottom.y - p_top.y) * h)
             if abs(dx) + abs(dy) > 1e-6:
@@ -391,6 +404,14 @@ def detect_face_polygons_mediapipe(
                 eye_rot = None
                 eye_dist = None
 
+            # Prefer eye-line midpoint as translation center; fallback to nose tip.
+            if eye_rot is not None:
+                center_x = 0.5 * (lx + rx)
+                center_y = 0.5 * (ly + ry)
+            else:
+                center_x = nose_cx
+                center_y = nose_cy
+
             if eye_rot is not None and nose_rot is not None:
                 # Eye-line gives robust roll; keep some nose-axis influence.
                 rot_angle = 0.75 * eye_rot + 0.25 * nose_rot
@@ -405,7 +426,7 @@ def detect_face_polygons_mediapipe(
                 rot_angle = float(np.clip(rot_angle, -MAX_ROLL_CORRECTION_DEG, MAX_ROLL_CORRECTION_DEG))
                 if abs(rot_angle) < ROLL_DEADZONE_DEG:
                     rot_angle = 0.0
-                center = (cx, cy)
+                center = (center_x, center_y)
             else:
                 if fallback_to_previous:
                     center = prev_center
@@ -669,7 +690,6 @@ def transform_frames_with_roi(
 
     if canonical_face_mask:
         align_nose_axis = True
-        face_mesh_first_frame_mask = True
         center_face = True
 
     bbox = detect_face_bbox(
@@ -736,12 +756,31 @@ def transform_frames_with_roi(
                     _dummy, canonical_poly = _translate_frame_and_polygon(_dummy, canonical_poly, base_center, canvas_center)
 
                 bbox = _poly_to_bbox(canonical_poly, w, h)
+                last_valid_center = static_center
+                last_valid_angle = static_angle
+                last_valid_scale = static_scale
                 for i, frame in enumerate(frames):
                     curr_frame = frame
                     curr_poly = canonical_poly
                     curr_center = frame_centers[i] if i < len(frame_centers) else None
                     curr_angle = frame_angles[i] if i < len(frame_angles) else None
                     curr_scale = frame_scales[i] if i < len(frame_scales) else None
+
+                    # If a frame misses landmarks, keep geometric registration stable by
+                    # reusing the latest valid alignment parameters.
+                    if curr_center is None:
+                        curr_center = last_valid_center
+                    else:
+                        last_valid_center = curr_center
+                    if curr_angle is None:
+                        curr_angle = last_valid_angle
+                    else:
+                        last_valid_angle = curr_angle
+                    if curr_scale is None:
+                        curr_scale = last_valid_scale
+                    else:
+                        last_valid_scale = curr_scale
+
                     if align_nose_axis and curr_center is not None and curr_angle is not None and abs(float(curr_angle)) > 1e-4:
                         curr_frame, _tmp_poly = _rotate_frame_and_polygon(curr_frame, static_poly, curr_center, curr_angle)
 

@@ -44,6 +44,12 @@ def main():
                         help='How to select/aggregate clips: random by clip, or grouped by subject')
     parser.add_argument('--dataset_name', type=str, default='auto', choices=['auto', 'ubfc', 'ubfc_phys'],
                         help='Dataset tag used for eval output folders and filenames')
+    parser.add_argument('--ppg_max_lag_frames', type=int, default=0,
+                        help='If >0, search lag in [-N, N] frames for lag-compensated waveform metrics.')
+    parser.add_argument('--subject_ppg_clips_per_figure', type=int, default=10,
+                        help='Number of clips to concatenate per subject PPG figure page (default: 10).')
+    parser.add_argument('--subject_ppg_raw_scale', action='store_true',
+                        help='If set, subject-level PPG prediction plots use raw amplitude instead of z-score normalization.')
     args = parser.parse_args()
 
     # configure logging according to verbosity flag
@@ -251,6 +257,49 @@ def main():
         b = _zscore(b)
         return float(np.sqrt(np.mean((a - b) ** 2)))
 
+    def _align_by_lag(a: np.ndarray, b: np.ndarray, lag: int) -> tuple[np.ndarray, np.ndarray]:
+        a = np.asarray(a, dtype=np.float32)
+        b = np.asarray(b, dtype=np.float32)
+        if lag == 0:
+            n = min(a.size, b.size)
+            return a[:n], b[:n]
+        if lag > 0:
+            if lag >= a.size or lag >= b.size:
+                return np.asarray([], dtype=np.float32), np.asarray([], dtype=np.float32)
+            return a[lag:], b[:-lag]
+        shift = -lag
+        if shift >= a.size or shift >= b.size:
+            return np.asarray([], dtype=np.float32), np.asarray([], dtype=np.float32)
+        return a[:-shift], b[shift:]
+
+    def _best_lag_metrics(a: np.ndarray, b: np.ndarray, max_lag: int) -> tuple[float, float, int]:
+        max_lag = int(max(0, max_lag))
+        if max_lag == 0:
+            return _safe_corr(a, b), _norm_rmse(a, b), 0
+
+        best_corr = float('nan')
+        best_nrmse = float('nan')
+        best_lag = 0
+        best_score = -1e18
+
+        for lag in range(-max_lag, max_lag + 1):
+            aa, bb = _align_by_lag(a, b, lag)
+            if aa.size < 3 or bb.size < 3:
+                continue
+            c = _safe_corr(aa, bb)
+            if np.isnan(c):
+                continue
+            score = float(c) - 1e-6 * abs(lag)
+            if score > best_score:
+                best_score = score
+                best_corr = float(c)
+                best_nrmse = _norm_rmse(aa, bb)
+                best_lag = int(lag)
+
+        if best_score <= -1e17:
+            return float('nan'), float('nan'), 0
+        return best_corr, best_nrmse, best_lag
+
     def extract_subject_name(file_name: str) -> str:
         if '_clip_' in file_name:
             return file_name.split('_clip_', 1)[0]
@@ -266,6 +315,9 @@ def main():
     records = []
     ppg_corrs = []
     ppg_nrmse = []
+    ppg_corrs_lag = []
+    ppg_nrmse_lag = []
+    ppg_best_lags = []
 
     # Manual batching so we can access filenames / per-file fps
     total = len(ds.files)
@@ -366,6 +418,14 @@ def main():
                     pred_aligned, true_aligned = _align_true_ppg_to_pred(sig, np.asarray(true_ppg))
                     ppg_corrs.append(_safe_corr(pred_aligned, true_aligned))
                     ppg_nrmse.append(_norm_rmse(pred_aligned, true_aligned))
+                    corr_lag, nrmse_lag, best_lag = _best_lag_metrics(
+                        pred_aligned,
+                        true_aligned,
+                        max_lag=int(args.ppg_max_lag_frames),
+                    )
+                    ppg_corrs_lag.append(corr_lag)
+                    ppg_nrmse_lag.append(nrmse_lag)
+                    ppg_best_lags.append(best_lag)
 
                 processed += 1
                 if processed >= max_samples:
@@ -408,6 +468,9 @@ def main():
 
     valid_corr = np.array([x for x in ppg_corrs if not np.isnan(x)], dtype=float)
     valid_nrmse = np.array([x for x in ppg_nrmse if not np.isnan(x)], dtype=float)
+    valid_corr_lag = np.array([x for x in ppg_corrs_lag if not np.isnan(x)], dtype=float)
+    valid_nrmse_lag = np.array([x for x in ppg_nrmse_lag if not np.isnan(x)], dtype=float)
+    valid_best_lag = np.array(ppg_best_lags, dtype=float) if len(ppg_best_lags) > 0 else np.array([], dtype=float)
     if valid_corr.size > 0:
         logger.info(
             'PPG waveform metrics: mean_corr=%.4f, median_corr=%.4f, mean_nRMSE=%.4f (n=%d clips)',
@@ -416,6 +479,15 @@ def main():
             float(np.mean(valid_nrmse)) if valid_nrmse.size > 0 else float('nan'),
             int(valid_corr.size),
         )
+        if int(args.ppg_max_lag_frames) > 0 and valid_corr_lag.size > 0:
+            logger.info(
+                'PPG lag-comp metrics (max_lag=%d): mean_corr=%.4f, median_corr=%.4f, mean_nRMSE=%.4f, mean_best_lag=%.2f frames',
+                int(args.ppg_max_lag_frames),
+                float(np.mean(valid_corr_lag)),
+                float(np.median(valid_corr_lag)),
+                float(np.mean(valid_nrmse_lag)) if valid_nrmse_lag.size > 0 else float('nan'),
+                float(np.mean(valid_best_lag)) if valid_best_lag.size > 0 else float('nan'),
+            )
     else:
         logger.warning('No ground-truth PPG found in clip payloads, skipping waveform metrics.')
 
@@ -464,16 +536,24 @@ def main():
     ppg_csv = out_dir / f'ppg_metrics_{dataset_name}.csv'
     with open(ppg_csv, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['file', 'subject', 'ppg_corr', 'ppg_nrmse'])
+        writer.writerow(['file', 'subject', 'ppg_corr', 'ppg_nrmse', 'ppg_corr_lag', 'ppg_nrmse_lag', 'best_lag_frames'])
         for rec in records:
             true_ppg = rec.get('true_ppg')
             corr = float('nan')
             nrmse = float('nan')
+            corr_lag = float('nan')
+            nrmse_lag = float('nan')
+            best_lag = 0
             if true_ppg is not None:
                 pred_aligned, true_aligned = _align_true_ppg_to_pred(np.asarray(rec['signal']), np.asarray(true_ppg))
                 corr = _safe_corr(pred_aligned, true_aligned)
                 nrmse = _norm_rmse(pred_aligned, true_aligned)
-            writer.writerow([rec['file'], rec['subject'], corr, nrmse])
+                corr_lag, nrmse_lag, best_lag = _best_lag_metrics(
+                    pred_aligned,
+                    true_aligned,
+                    max_lag=int(args.ppg_max_lag_frames),
+                )
+            writer.writerow([rec['file'], rec['subject'], corr, nrmse, corr_lag, nrmse_lag, best_lag])
 
     # Save a simple subject-level summary CSV as well
     summary_csv = out_dir / f'subject_summary_{dataset_name}.csv'
@@ -497,19 +577,42 @@ def main():
     ppg_subject_csv = out_dir / f'subject_ppg_summary_{dataset_name}.csv'
     with open(ppg_subject_csv, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['subject', 'n_clips_with_ppg', 'mean_ppg_corr', 'median_ppg_corr', 'mean_ppg_nrmse'])
+        writer.writerow([
+            'subject',
+            'n_clips_with_ppg',
+            'mean_ppg_corr',
+            'median_ppg_corr',
+            'mean_ppg_nrmse',
+            'mean_ppg_corr_lag',
+            'median_ppg_corr_lag',
+            'mean_ppg_nrmse_lag',
+            'mean_best_lag_frames',
+        ])
         for subj, items in sorted(subj_stats.items()):
             subj_records = [r for r in records if r['subject'] == subj and r.get('true_ppg') is not None]
             corr_vals = []
             nrmse_vals = []
+            corr_vals_lag = []
+            nrmse_vals_lag = []
+            lag_vals = []
             for rec in subj_records:
                 pred_aligned, true_aligned = _align_true_ppg_to_pred(np.asarray(rec['signal']), np.asarray(rec['true_ppg']))
                 c = _safe_corr(pred_aligned, true_aligned)
                 e = _norm_rmse(pred_aligned, true_aligned)
+                c_lag, e_lag, lag_best = _best_lag_metrics(
+                    pred_aligned,
+                    true_aligned,
+                    max_lag=int(args.ppg_max_lag_frames),
+                )
                 if not np.isnan(c):
                     corr_vals.append(c)
                 if not np.isnan(e):
                     nrmse_vals.append(e)
+                if not np.isnan(c_lag):
+                    corr_vals_lag.append(c_lag)
+                if not np.isnan(e_lag):
+                    nrmse_vals_lag.append(e_lag)
+                lag_vals.append(lag_best)
             n = len(corr_vals)
             writer.writerow([
                 subj,
@@ -517,6 +620,10 @@ def main():
                 float(np.mean(corr_vals)) if n > 0 else float('nan'),
                 float(np.median(corr_vals)) if n > 0 else float('nan'),
                 float(np.mean(nrmse_vals)) if len(nrmse_vals) > 0 else float('nan'),
+                float(np.mean(corr_vals_lag)) if len(corr_vals_lag) > 0 else float('nan'),
+                float(np.median(corr_vals_lag)) if len(corr_vals_lag) > 0 else float('nan'),
+                float(np.mean(nrmse_vals_lag)) if len(nrmse_vals_lag) > 0 else float('nan'),
+                float(np.mean(lag_vals)) if len(lag_vals) > 0 else float('nan'),
             ])
 
     try:
@@ -622,37 +729,135 @@ def main():
 
         def save_subject_ppg_figure(subject_name, subject_records):
             subject_records = sorted(subject_records, key=lambda item: item['file'])
-            fps_val = float(subject_records[0]['fps']) if subject_records else float(args.fps)
-            signals = [np.asarray(item['signal']) for item in subject_records]
-            combined_signal = np.concatenate(signals) if signals else np.asarray([])
-            # combine true PPGs if available for overlay
-            true_signals = [np.asarray(item['true_ppg']) for item in subject_records if item.get('true_ppg') is not None]
-            combined_true = np.concatenate(true_signals) if true_signals else None
-            time_axis = np.arange(combined_signal.size) / fps_val if combined_signal.size else np.asarray([])
+            if not subject_records:
+                return
+
+            clips_per_page = max(1, int(args.subject_ppg_clips_per_figure))
             subject_dir = out_dir / subject_name
             subject_dir.mkdir(parents=True, exist_ok=True)
-            fig, ax = plt.subplots(figsize=(14, 4))
-            ax.plot(time_axis, combined_signal, color='tab:blue', linewidth=1.0, label='predicted PPG')
 
-            if combined_true is not None and combined_true.size:
-                # align lengths by truncation if needed
-                minlen = min(combined_true.size, combined_signal.size)
-                if minlen > 0:
-                    ax.plot(time_axis[:minlen], combined_true[:minlen], color='tab:red', linestyle='--', linewidth=0.9, label='true PPG')
+            pages = [subject_records[i:i + clips_per_page] for i in range(0, len(subject_records), clips_per_page)]
+            total_pages = len(pages)
 
-            boundary = 0
-            for item, signal in zip(subject_records[:-1], signals[:-1]):
-                boundary += signal.size
-                ax.axvline(boundary / fps_val, color='gray', linestyle='--', linewidth=0.7, alpha=0.35)
+            for page_idx, page_records in enumerate(pages, start=1):
+                fps_val = float(page_records[0]['fps']) if page_records else float(args.fps)
+                signals = [np.asarray(item['signal']) for item in page_records]
+                pred_signals = [sig if args.subject_ppg_raw_scale else _zscore(sig) for sig in signals]
+                combined_signal = np.concatenate(pred_signals) if pred_signals else np.asarray([])
+                time_axis = np.arange(combined_signal.size) / fps_val if combined_signal.size else np.asarray([])
 
-            ax.set_title(f'Subject {subject_name} - combined predicted PPG')
-            ax.set_xlabel('Time (s)')
-            ax.set_ylabel('PPG amplitude')
-            ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.35)
-            ax.legend(loc='upper right')
-            fig.tight_layout()
-            fig.savefig(subject_dir / f'{subject_name}_ppg_prediction.png', dpi=200, bbox_inches='tight')
-            plt.close(fig)
+                fig_w = max(14.0, 9.0 + 0.7 * len(page_records))
+                fig, ax = plt.subplots(figsize=(fig_w, 4.2))
+                ax.plot(time_axis, combined_signal, color='tab:blue', linewidth=1.0, label='predicted PPG')
+
+                # Overlay true PPG clip-by-clip so alignment is preserved when some clips miss GT.
+                sample_offset = 0
+                true_labeled = False
+                for item, pred_sig, pred_sig_plot in zip(page_records, signals, pred_signals):
+                    true_sig = item.get('true_ppg')
+                    if true_sig is not None:
+                        p_aligned, t_aligned = _align_true_ppg_to_pred(np.asarray(pred_sig), np.asarray(true_sig))
+                        if t_aligned.size > 0:
+                            t_plot = t_aligned if args.subject_ppg_raw_scale else _zscore(t_aligned)
+                            tt = (sample_offset + np.arange(t_plot.size)) / fps_val
+                            ax.plot(
+                                tt,
+                                t_plot,
+                                color='tab:red',
+                                linestyle='--',
+                                linewidth=0.9,
+                                label='true PPG' if not true_labeled else None,
+                            )
+                            true_labeled = True
+                    sample_offset += pred_sig_plot.size
+
+                boundary = 0
+                for signal in signals[:-1]:
+                    boundary += signal.size
+                    ax.axvline(boundary / fps_val, color='gray', linestyle='--', linewidth=0.7, alpha=0.35)
+
+                if total_pages > 1:
+                    ax.set_title(
+                        f'Subject {subject_name} - combined predicted PPG '
+                        f'(page {page_idx}/{total_pages}, clips {clips_per_page} per page)'
+                    )
+                else:
+                    ax.set_title(f'Subject {subject_name} - combined predicted PPG')
+                ax.set_xlabel('Time (s)')
+                ax.set_ylabel('PPG amplitude' if args.subject_ppg_raw_scale else 'Normalized amplitude (z-score)')
+                ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.35)
+                ax.legend(loc='upper right')
+                fig.tight_layout()
+
+                page_path = subject_dir / f'{subject_name}_ppg_prediction_{page_idx:02d}.png'
+                fig.savefig(page_path, dpi=200, bbox_inches='tight')
+                if page_idx == 1:
+                    # Backward-compatible filename expected by existing workflows.
+                    fig.savefig(subject_dir / f'{subject_name}_ppg_prediction.png', dpi=200, bbox_inches='tight')
+                plt.close(fig)
+
+                # Optional lag-compensated visualization for this page.
+                if int(args.ppg_max_lag_frames) > 0:
+                    lag_pred_segments = []
+                    lag_true_segments = []
+                    lag_values = []
+
+                    for item, pred_sig in zip(page_records, signals):
+                        true_sig = item.get('true_ppg')
+                        if true_sig is None:
+                            continue
+                        p_base, t_base = _align_true_ppg_to_pred(np.asarray(pred_sig), np.asarray(true_sig))
+                        _, _, best_lag = _best_lag_metrics(
+                            p_base,
+                            t_base,
+                            max_lag=int(args.ppg_max_lag_frames),
+                        )
+                        p_lag, t_lag = _align_by_lag(p_base, t_base, best_lag)
+                        if p_lag.size < 3 or t_lag.size < 3:
+                            continue
+                        if not args.subject_ppg_raw_scale:
+                            p_lag = _zscore(p_lag)
+                            t_lag = _zscore(t_lag)
+                        lag_pred_segments.append(p_lag)
+                        lag_true_segments.append(t_lag)
+                        lag_values.append(best_lag)
+
+                    if lag_pred_segments and lag_true_segments:
+                        lag_pred_all = np.concatenate(lag_pred_segments)
+                        lag_true_all = np.concatenate(lag_true_segments)
+                        lag_time = np.arange(lag_pred_all.size) / fps_val
+
+                        fig_lag, ax_lag = plt.subplots(figsize=(fig_w, 4.2))
+                        ax_lag.plot(lag_time, lag_pred_all, color='tab:blue', linewidth=1.0, label='predicted PPG (lag-aligned)')
+                        ax_lag.plot(lag_time, lag_true_all, color='tab:red', linestyle='--', linewidth=0.9, label='true PPG (lag-aligned)')
+
+                        lag_boundary = 0
+                        for seg in lag_pred_segments[:-1]:
+                            lag_boundary += seg.size
+                            ax_lag.axvline(lag_boundary / fps_val, color='gray', linestyle='--', linewidth=0.7, alpha=0.35)
+
+                        mean_lag = float(np.mean(lag_values)) if len(lag_values) > 0 else 0.0
+                        if total_pages > 1:
+                            ax_lag.set_title(
+                                f'Subject {subject_name} - lag-compensated PPG '
+                                f'(page {page_idx}/{total_pages}, mean lag={mean_lag:.2f} frames)'
+                            )
+                        else:
+                            ax_lag.set_title(
+                                f'Subject {subject_name} - lag-compensated PPG '
+                                f'(mean lag={mean_lag:.2f} frames)'
+                            )
+                        ax_lag.set_xlabel('Time (s)')
+                        ax_lag.set_ylabel('PPG amplitude' if args.subject_ppg_raw_scale else 'Normalized amplitude (z-score)')
+                        ax_lag.grid(True, linestyle='--', linewidth=0.5, alpha=0.35)
+                        ax_lag.legend(loc='upper right')
+                        fig_lag.tight_layout()
+
+                        lag_page_path = subject_dir / f'{subject_name}_ppg_prediction_{page_idx:02d}_lag.png'
+                        fig_lag.savefig(lag_page_path, dpi=200, bbox_inches='tight')
+                        if page_idx == 1:
+                            fig_lag.savefig(subject_dir / f'{subject_name}_ppg_prediction_lag.png', dpi=200, bbox_inches='tight')
+                        plt.close(fig_lag)
 
         def save_subject_hr_figure(subject_name, subject_records):
             subject_records = sorted(subject_records, key=lambda item: item['file'])

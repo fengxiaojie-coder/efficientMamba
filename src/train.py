@@ -6,6 +6,7 @@ Usage (quick run):
 from __future__ import annotations
 
 import argparse
+import json
 import random
 from pathlib import Path
 import time
@@ -20,6 +21,7 @@ import torch
 from torch import nn
 import torch.optim as torch_optim
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 import logging
 
 logger = logging.getLogger(__name__)
@@ -56,8 +58,8 @@ def _sample_clip_temporal_lengths(clip_roots: list[Path], max_files: int = 256) 
 
 def _neg_pearson_loss(preds: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """Return 1-r where r is Pearson correlation over the current batch."""
-    x = preds.view(-1)
-    y = target.view(-1)
+    x = preds.reshape(-1)
+    y = target.reshape(-1)
     x = x - torch.mean(x)
     y = y - torch.mean(y)
     denom = torch.sqrt(torch.sum(x * x) * torch.sum(y * y) + eps)
@@ -82,8 +84,257 @@ def _pearson_corr(preds: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) 
     return float((torch.sum(x * y) / denom).item())
 
 
+def _align_by_lag_torch(preds: torch.Tensor, target: torch.Tensor, lag: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Align [B,T,1] waveform tensors by integer frame lag.
+
+    lag > 0 means preds are shifted forward relative to target.
+    """
+    if lag == 0:
+        return preds, target
+    t = preds.size(1)
+    if lag > 0:
+        if lag >= t:
+            return preds[:, :0, :], target[:, :0, :]
+        return preds[:, lag:, :], target[:, :-lag, :]
+    shift = -lag
+    if shift >= t:
+        return preds[:, :0, :], target[:, :0, :]
+    return preds[:, :-shift, :], target[:, shift:, :]
+
+
+def _align_by_lag_numpy(preds: np.ndarray, target: np.ndarray, lag: int) -> tuple[np.ndarray, np.ndarray]:
+    """Align [N,T] waveform arrays by integer frame lag."""
+    if lag == 0:
+        return preds, target
+    t = preds.shape[1]
+    if lag > 0:
+        if lag >= t:
+            return preds[:, :0], target[:, :0]
+        return preds[:, lag:], target[:, :-lag]
+    shift = -lag
+    if shift >= t:
+        return preds[:, :0], target[:, :0]
+    return preds[:, :-shift], target[:, shift:]
+
+
+def _safe_pearson_numpy(preds: np.ndarray, target: np.ndarray) -> float:
+    """Compute Pearson r over flattened arrays with finite checks."""
+    x = preds.reshape(-1)
+    y = target.reshape(-1)
+    if x.size <= 1 or y.size <= 1:
+        return float('nan')
+    r = np.corrcoef(x, y)[0, 1]
+    return float(r) if np.isfinite(r) else float('nan')
+
+
+def _best_lag_pearson_numpy(preds: np.ndarray, target: np.ndarray, max_lag: int) -> tuple[int, float]:
+    """Find lag in [-max_lag, max_lag] that maximizes Pearson r."""
+    max_lag = int(max(0, max_lag))
+    best_lag = 0
+    best_corr = _safe_pearson_numpy(preds, target)
+
+    if max_lag <= 0:
+        return best_lag, best_corr
+
+    for lag in range(-max_lag, max_lag + 1):
+        p_aligned, t_aligned = _align_by_lag_numpy(preds, target, lag)
+        if p_aligned.shape[1] < 3:
+            continue
+        cur_corr = _safe_pearson_numpy(p_aligned, t_aligned)
+        if not np.isfinite(cur_corr):
+            continue
+        if (not np.isfinite(best_corr)) or (cur_corr > best_corr) or (
+            abs(cur_corr - best_corr) <= 1e-9 and abs(lag) < abs(best_lag)
+        ):
+            best_lag = lag
+            best_corr = cur_corr
+
+    return best_lag, best_corr
+
+
+def _best_lag_pearson_per_clip_numpy(
+    preds: np.ndarray,
+    target: np.ndarray,
+    max_lag: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Find per-clip best lag and Pearson r for [N,T] arrays."""
+    max_lag = int(max(0, max_lag))
+    n = int(preds.shape[0])
+    best_lags = np.zeros((n,), dtype=np.int32)
+    best_corrs = np.full((n,), np.nan, dtype=np.float64)
+
+    for i in range(n):
+        p = preds[i:i + 1]
+        t = target[i:i + 1]
+        best_lag = 0
+        best_corr = _safe_pearson_numpy(p, t)
+
+        if max_lag > 0:
+            for lag in range(-max_lag, max_lag + 1):
+                p_aligned, t_aligned = _align_by_lag_numpy(p, t, lag)
+                if p_aligned.shape[1] < 3:
+                    continue
+                cur_corr = _safe_pearson_numpy(p_aligned, t_aligned)
+                if not np.isfinite(cur_corr):
+                    continue
+                if (not np.isfinite(best_corr)) or (cur_corr > best_corr) or (
+                    abs(cur_corr - best_corr) <= 1e-9 and abs(lag) < abs(best_lag)
+                ):
+                    best_lag = lag
+                    best_corr = cur_corr
+
+        best_lags[i] = int(best_lag)
+        best_corrs[i] = float(best_corr) if np.isfinite(best_corr) else np.nan
+
+    return best_lags, best_corrs
+
+
+def _format_lag_distribution(lag_counts: dict[int, int]) -> str:
+    """Format lag histogram as a compact string like -1:12|0:88|1:9."""
+    if not lag_counts:
+        return 'none'
+    return '|'.join(f'{int(k)}:{int(v)}' for k, v in sorted(lag_counts.items(), key=lambda kv: kv[0]))
+
+
+def _lag_mode_from_counts(lag_counts: dict[int, int]) -> int:
+    """Return modal lag; ties prefer smaller absolute lag then smaller lag."""
+    if not lag_counts:
+        return 0
+    max_count = max(lag_counts.values())
+    candidates = [k for k, v in lag_counts.items() if v == max_count]
+    return int(sorted(candidates, key=lambda x: (abs(x), x))[0])
+
+
+def _best_lag_base_loss_per_clip(
+    preds: torch.Tensor,
+    target: torch.Tensor,
+    base_loss_fn,
+    max_lag: int,
+) -> tuple[list[int], torch.Tensor]:
+    """Compute per-clip best lag by minimum loss and return mean best loss."""
+    max_lag = int(max(0, max_lag))
+    bsz = int(preds.size(0))
+    best_lags: list[int] = []
+    best_losses: list[torch.Tensor] = []
+
+    for bi in range(bsz):
+        p_i = preds[bi:bi + 1]
+        t_i = target[bi:bi + 1]
+
+        best_lag = 0
+        best_loss = base_loss_fn(p_i, t_i)
+        best_score = float(best_loss.detach().item())
+
+        if max_lag > 0:
+            for lag in range(-max_lag, max_lag + 1):
+                p_aligned, t_aligned = _align_by_lag_torch(p_i, t_i, lag)
+                if p_aligned.size(1) < 3:
+                    continue
+                cur_loss = base_loss_fn(p_aligned, t_aligned)
+                cur_score = float(cur_loss.detach().item())
+                if (cur_score < best_score) or (abs(cur_score - best_score) <= 1e-9 and abs(lag) < abs(best_lag)):
+                    best_score = cur_score
+                    best_loss = cur_loss
+                    best_lag = lag
+
+        best_lags.append(int(best_lag))
+        best_losses.append(best_loss)
+
+    if not best_losses:
+        return best_lags, preds.new_tensor(float('nan'))
+    return best_lags, torch.stack(best_losses).mean()
+
+
+def _soft_lag_base_loss_per_clip(
+    preds: torch.Tensor,
+    target: torch.Tensor,
+    base_loss_fn,
+    max_lag: int,
+    temperature: float,
+) -> tuple[list[float], torch.Tensor]:
+    """Compute per-clip soft lag expectation and softmax-weighted mean loss."""
+    max_lag = int(max(0, max_lag))
+    temp = float(max(1e-6, temperature))
+    bsz = int(preds.size(0))
+    soft_lags: list[float] = []
+    soft_losses: list[torch.Tensor] = []
+
+    for bi in range(bsz):
+        p_i = preds[bi:bi + 1]
+        t_i = target[bi:bi + 1]
+
+        lag_values: list[int] = []
+        loss_terms: list[torch.Tensor] = []
+
+        if max_lag <= 0:
+            lag_values = [0]
+            loss_terms = [base_loss_fn(p_i, t_i)]
+        else:
+            for lag in range(-max_lag, max_lag + 1):
+                p_aligned, t_aligned = _align_by_lag_torch(p_i, t_i, lag)
+                if p_aligned.size(1) < 3:
+                    continue
+                lag_values.append(int(lag))
+                loss_terms.append(base_loss_fn(p_aligned, t_aligned))
+
+            if not loss_terms:
+                lag_values = [0]
+                loss_terms = [base_loss_fn(p_i, t_i)]
+
+        loss_stack = torch.stack(loss_terms)
+        logits = -torch.stack([loss.detach() for loss in loss_terms]) / temp
+        weights = torch.softmax(logits, dim=0)
+        soft_loss = torch.sum(weights * loss_stack)
+        lag_tensor = torch.tensor(lag_values, device=preds.device, dtype=preds.dtype)
+        soft_lag = torch.sum(weights * lag_tensor)
+
+        soft_lags.append(float(soft_lag.item()))
+        soft_losses.append(soft_loss)
+
+    if not soft_losses:
+        return soft_lags, preds.new_tensor(float('nan'))
+    return soft_lags, torch.stack(soft_losses).mean()
+
+
+def _best_lag_base_loss(
+    preds: torch.Tensor,
+    target: torch.Tensor,
+    base_loss_fn,
+    max_lag: int,
+) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Find lag with minimum base loss and return aligned tensors and best loss."""
+    max_lag = int(max(0, max_lag))
+    best_lag = 0
+    best_preds = preds
+    best_target = target
+    best_loss = base_loss_fn(preds, target)
+    best_score = float(best_loss.detach().item())
+
+    if max_lag <= 0:
+        return best_lag, best_preds, best_target, best_loss
+
+    for lag in range(-max_lag, max_lag + 1):
+        p_aligned, t_aligned = _align_by_lag_torch(preds, target, lag)
+        if p_aligned.size(1) < 3:
+            continue
+        cur_loss = base_loss_fn(p_aligned, t_aligned)
+        cur_score = float(cur_loss.detach().item())
+        if (cur_score < best_score) or (abs(cur_score - best_score) <= 1e-9 and abs(lag) < abs(best_lag)):
+            best_score = cur_score
+            best_loss = cur_loss
+            best_lag = lag
+            best_preds = p_aligned
+            best_target = t_aligned
+
+    return best_lag, best_preds, best_target, best_loss
+
+
 def _build_roi_map(clips, roi_types, device):
-    """Build centered Gaussian ROI bias map for non-full ROI samples."""
+    """Build data-driven soft ROI prior for non-full ROI samples.
+
+    For each sample, estimate ROI support from non-black raw pixels,
+    aggregate over time, then smooth into a soft map in [0, 1].
+    """
     if roi_types is None:
         return None
     try:
@@ -91,20 +342,74 @@ def _build_roi_map(clips, roi_types, device):
         H = clips.size(-2)
         W = clips.size(-1)
         mask = torch.ones((B, 1, H, W), device=device)
-        ys = torch.linspace(-1, 1, H, device=device).unsqueeze(1).expand(H, W)
-        xs = torch.linspace(-1, 1, W, device=device).unsqueeze(0).expand(H, W)
-        dist2 = xs ** 2 + ys ** 2
-        g = torch.exp(-dist2 / (0.5 ** 2))
+
+        # Prefer raw channels (3:6) for ROI support when available.
+        # clips shape: [B, T, 6, H, W] in normal training.
+        if clips.size(2) >= 6:
+            raw = clips[:, :, 3:6, :, :]
+        else:
+            raw = clips[:, :, :3, :, :]
+
+        # Binary ROI support per frame, then temporal mean.
+        support_t = (raw.abs().sum(dim=2) > 1e-6).float()  # [B, T, H, W]
+        support = support_t.mean(dim=1, keepdim=True)      # [B, 1, H, W]
+
+        # Smooth into a soft prior to avoid hard-edge bias.
+        support = F.avg_pool2d(support, kernel_size=5, stride=1, padding=2)
+        support = F.avg_pool2d(support, kernel_size=5, stride=1, padding=2)
+        support = torch.clamp(support, 0.0, 1.0)
+
+        # Keep a small floor so the prior guides but doesn't collapse attention.
+        soft_support = 0.15 + 0.85 * support
+
         for i, rt in enumerate(roi_types):
             if isinstance(rt, bytes):
                 rt = rt.decode()
             if rt is None or rt == 'full':
                 mask[i, 0] = 1.0
             else:
-                mask[i, 0] = g
+                mask[i, 0] = soft_support[i, 0]
         return mask
     except Exception:
         return None
+
+
+def _suppress_edge_diff_outliers(
+    clips: torch.Tensor,
+    diff_edge_abs_max: float = 0.0,
+    edge_width: int = 1,
+) -> torch.Tensor:
+    """Zero diff-channel outliers on ROI edge pixels.
+
+    clips shape: [B, T, 6, H, W], where channels 0:3 are diff and 3:6 are raw.
+    Edge is estimated from non-black raw ROI mask using morphological gradient.
+    """
+    thr = float(diff_edge_abs_max)
+    if thr <= 0.0:
+        return clips
+
+    w = int(max(1, edge_width))
+    B, T, C, H, W = clips.shape
+    if C < 6:
+        return clips
+
+    raw = clips[:, :, 3:6, :, :]
+    face_mask = (raw.abs().sum(dim=2, keepdim=True) > 1e-6).float()  # [B,T,1,H,W]
+
+    face_bt = face_mask.reshape(B * T, 1, H, W)
+    k = 2 * w + 1
+    dil = F.max_pool2d(face_bt, kernel_size=k, stride=1, padding=w)
+    ero = 1.0 - F.max_pool2d(1.0 - face_bt, kernel_size=k, stride=1, padding=w)
+    edge_bt = (dil - ero) > 0.0
+    edge = edge_bt.reshape(B, T, 1, H, W)
+
+    diff = clips[:, :, 0:3, :, :]
+    outlier = diff.abs() > thr
+    suppress = outlier & edge.expand_as(outlier)
+    if suppress.any():
+        clips = clips.clone()
+        clips[:, :, 0:3, :, :] = diff.masked_fill(suppress, 0.0)
+    return clips
 
 
 def _compute_grad_norm(model: nn.Module) -> float:
@@ -208,6 +513,11 @@ def train_epoch(
     epoch: int = 0,
     save_dir: Path | None = None,
     debug_viz_every_steps: int = 0,
+    diff_edge_abs_max: float = 0.0,
+    diff_edge_width: int = 1,
+    train_max_lag_frames: int = 0,
+    train_shift_invariant_weight: float = 0.0,
+    train_lag_temperature: float = 1.0,
 ):
     model.train()
     total_loss = 0.0
@@ -226,6 +536,11 @@ def train_epoch(
             roi_types = None
 
         clips = clips.to(device)  # [B, T, 6, H, W]
+        clips = _suppress_edge_diff_outliers(
+            clips,
+            diff_edge_abs_max=float(diff_edge_abs_max),
+            edge_width=int(diff_edge_width),
+        )
         ppg = ppg.to(device)  # [B, T]
 
         # Reshape PPG to match model output: [B, T] -> [B, T, 1]
@@ -234,16 +549,42 @@ def train_epoch(
         elif ppg.dim() == 2:
             ppg = ppg.unsqueeze(-1)  # [B, T] -> [B, T, 1]
 
-        # build a simple centered Gaussian ROI map per-sample when explicit ROI was used
+        # build a data-driven soft ROI map per-sample when explicit ROI was used
         roi_map = _build_roi_map(clips, roi_types, device)
 
         optimizer.zero_grad()
         preds = model(clips, roi_map=roi_map) if roi_map is not None else model(clips)  # [B, T, 1]
 
-        # Optimize the same objective users configure: base loss + optional Pearson penalty.
-        base_loss = loss_fn(preds, ppg)
+        # Optimize configured objective with optional shift-invariant alignment.
+        si_w = float(np.clip(train_shift_invariant_weight, 0.0, 1.0))
+        max_lag = int(max(0, train_max_lag_frames))
+
+        base_loss_zero = loss_fn(preds, ppg)
+        if si_w > 0.0 and max_lag > 0:
+            _lags_base, base_loss_si = _soft_lag_base_loss_per_clip(
+                preds,
+                ppg,
+                loss_fn,
+                max_lag=max_lag,
+                temperature=float(train_lag_temperature),
+            )
+            base_loss = (1.0 - si_w) * base_loss_zero + si_w * base_loss_si
+        else:
+            base_loss = base_loss_zero
+
         if float(neg_pearson_coef) > 0.0:
-            pearson_penalty = _neg_pearson_loss(preds, ppg)
+            pearson_penalty_zero = _neg_pearson_loss(preds, ppg)
+            if si_w > 0.0 and max_lag > 0:
+                _lags_pearson, pearson_penalty_si = _soft_lag_base_loss_per_clip(
+                    preds,
+                    ppg,
+                    _neg_pearson_loss,
+                    max_lag=max_lag,
+                    temperature=float(train_lag_temperature),
+                )
+                pearson_penalty = (1.0 - si_w) * pearson_penalty_zero + si_w * pearson_penalty_si
+            else:
+                pearson_penalty = pearson_penalty_zero
             loss = base_loss + float(neg_pearson_coef) * pearson_penalty
         else:
             loss = base_loss
@@ -293,6 +634,11 @@ def eval_model(
     max_batches: int = 0,
     loss_fn: nn.Module | None = None,
     neg_pearson_coef: float = 0.0,
+    diff_edge_abs_max: float = 0.0,
+    diff_edge_width: int = 1,
+    train_max_lag_frames: int = 0,
+    train_shift_invariant_weight: float = 0.0,
+    train_lag_temperature: float = 1.0,
 ):
     model.eval()
     import numpy as np
@@ -314,39 +660,51 @@ def eval_model(
                 roi_types = None
 
             clips = clips.to(device)
+            clips = _suppress_edge_diff_outliers(
+                clips,
+                diff_edge_abs_max=float(diff_edge_abs_max),
+                edge_width=int(diff_edge_width),
+            )
             if ppg.dim() == 2:
                 ppg = ppg.unsqueeze(-1)  # [B, T] -> [B, T, 1]
             ppg = ppg.to(device)
 
-            roi_map = None
-            if roi_types is not None:
-                try:
-                    B = clips.size(0)
-                    H = clips.size(-2)
-                    W = clips.size(-1)
-                    mask = torch.ones((B, 1, H, W), device=device)
-                    for i, rt in enumerate(roi_types):
-                        if isinstance(rt, bytes):
-                            rt = rt.decode()
-                        if rt is None or rt == 'full':
-                            mask[i, 0] = 1.0
-                        else:
-                            ys = torch.linspace(-1, 1, H, device=device).unsqueeze(1).expand(H, W)
-                            xs = torch.linspace(-1, 1, W, device=device).unsqueeze(0).expand(H, W)
-                            dist2 = xs ** 2 + ys ** 2
-                            g = torch.exp(-dist2 / (0.5 ** 2))
-                            mask[i, 0] = g
-                    roi_map = mask
-                except Exception:
-                    roi_map = None
+            roi_map = _build_roi_map(clips, roi_types, device)
 
             out = model(clips, roi_map=roi_map) if roi_map is not None else model(clips)  # [B, T, 1]
             preds_all.append(out.cpu().numpy())
             ppgs_all.append(ppg.cpu().numpy())
             if loss_fn is not None:
-                base_loss = loss_fn(out, ppg)
+                si_w = float(np.clip(train_shift_invariant_weight, 0.0, 1.0))
+                max_lag = int(max(0, train_max_lag_frames))
+
+                base_loss_zero = loss_fn(out, ppg)
+                if si_w > 0.0 and max_lag > 0:
+                    _lags_base, base_loss_si = _soft_lag_base_loss_per_clip(
+                        out,
+                        ppg,
+                        loss_fn,
+                        max_lag=max_lag,
+                        temperature=float(train_lag_temperature),
+                    )
+                    base_loss = (1.0 - si_w) * base_loss_zero + si_w * base_loss_si
+                else:
+                    base_loss = base_loss_zero
+
                 if float(neg_pearson_coef) > 0.0:
-                    batch_loss = base_loss + float(neg_pearson_coef) * _neg_pearson_loss(out, ppg)
+                    pearson_penalty_zero = _neg_pearson_loss(out, ppg)
+                    if si_w > 0.0 and max_lag > 0:
+                        _lags_pearson, pearson_penalty_si = _soft_lag_base_loss_per_clip(
+                            out,
+                            ppg,
+                            _neg_pearson_loss,
+                            max_lag=max_lag,
+                            temperature=float(train_lag_temperature),
+                        )
+                        pearson_penalty = (1.0 - si_w) * pearson_penalty_zero + si_w * pearson_penalty_si
+                    else:
+                        pearson_penalty = pearson_penalty_zero
+                    batch_loss = base_loss + float(neg_pearson_coef) * pearson_penalty
                 else:
                     batch_loss = base_loss
                 eval_loss_sum += float(batch_loss.item()) * clips.size(0)
@@ -359,9 +717,25 @@ def eval_model(
             'pred_max': float('nan'),
             'true_mean': float('nan'),
             'true_std': float('nan'),
-        }, float('nan')
-    preds = np.vstack(preds_all).squeeze()  # [N, T] after squeeze
-    ppgs = np.vstack(ppgs_all).squeeze()   # [N, T] after squeeze
+        }, float('nan'), float('nan'), {
+            'hard_pearson': float('nan'),
+            'hard_mode': 0,
+            'hard_mean': 0.0,
+            'hard_median': 0.0,
+            'mean': 0.0,
+            'median': 0.0,
+            'sample_100': [],
+        }
+    preds = np.vstack(preds_all)
+    ppgs = np.vstack(ppgs_all)
+    if preds.ndim == 3 and preds.shape[-1] == 1:
+        preds = preds[..., 0]
+    if ppgs.ndim == 3 and ppgs.shape[-1] == 1:
+        ppgs = ppgs[..., 0]
+    if preds.ndim == 1:
+        preds = preds[np.newaxis, :]
+    if ppgs.ndim == 1:
+        ppgs = ppgs[np.newaxis, :]
     # Compute frame-wise MSE
     mse = float(np.mean((preds - ppgs) ** 2))
     pred_stats = {
@@ -372,9 +746,50 @@ def eval_model(
         'true_mean': float(np.mean(ppgs)),
         'true_std': float(np.std(ppgs)),
     }
-    pearson = float(np.corrcoef(preds.reshape(-1), ppgs.reshape(-1))[0, 1]) if preds.size > 1 and ppgs.size > 1 else float('nan')
+    pearson = _safe_pearson_numpy(preds, ppgs)
+    lag_search = int(max(0, train_max_lag_frames))
+    if lag_search > 0:
+        hard_lags, hard_corrs = _best_lag_pearson_per_clip_numpy(preds, ppgs, max_lag=lag_search)
+        hard_counts = dict(sorted(Counter(int(v) for v in hard_lags.tolist()).items()))
+        hard_finite = np.isfinite(hard_corrs)
+        hard_pearson = float(np.mean(hard_corrs[hard_finite])) if np.any(hard_finite) else float('nan')
+        hard_mode = _lag_mode_from_counts(hard_counts)
+        hard_mean = float(np.mean(hard_lags)) if hard_lags.size > 0 else 0.0
+        hard_median = float(np.median(hard_lags)) if hard_lags.size > 0 else 0.0
+
+        preds_t = torch.tensor(preds[..., np.newaxis], dtype=torch.float32)
+        ppgs_t = torch.tensor(ppgs[..., np.newaxis], dtype=torch.float32)
+        soft_lags, soft_pearson_loss = _soft_lag_base_loss_per_clip(
+            preds_t,
+            ppgs_t,
+            _neg_pearson_loss,
+            max_lag=lag_search,
+            temperature=float(train_lag_temperature),
+        )
+        pearson_lag = float(1.0 - soft_pearson_loss.detach().item()) if torch.isfinite(soft_pearson_loss) else float('nan')
+        lag_mean = float(np.mean(soft_lags)) if soft_lags else 0.0
+        lag_median = float(np.median(soft_lags)) if soft_lags else 0.0
+        lag_sample_100 = [float(v) for v in soft_lags[: min(100, len(soft_lags))]]
+    else:
+        pearson_lag = pearson
+        hard_pearson = pearson
+        hard_mode = 0
+        hard_mean = 0.0
+        hard_median = 0.0
+        lag_mean = 0.0
+        lag_median = 0.0
+        lag_sample_100 = [0.0 for _ in range(min(100, int(preds.shape[0])))]
+    lag_stats = {
+        'hard_pearson': float(hard_pearson),
+        'hard_mode': int(hard_mode),
+        'hard_mean': float(hard_mean),
+        'hard_median': float(hard_median),
+        'mean': float(lag_mean),
+        'median': float(lag_median),
+        'sample_100': lag_sample_100,
+    }
     eval_loss = float(eval_loss_sum / max(1, eval_count)) if loss_fn is not None else float('nan')
-    return mse, pred_stats, eval_loss, pearson
+    return mse, pred_stats, eval_loss, pearson, pearson_lag, lag_stats
 
 
 def main():
@@ -434,6 +849,16 @@ def main():
                         help='If >0, save quick debug visualizations every N training steps to checkpoints/debug_steps')
     parser.add_argument('--train_eval_batches', type=int, default=10,
                         help='Number of batches to sample for train-set eval each epoch (0=full, default=10 for speed)')
+    parser.add_argument('--diff_edge_abs_max', type=float, default=0.0,
+                        help='If >0, suppress diff-channel pixels with |diff| above threshold on ROI edge regions only.')
+    parser.add_argument('--diff_edge_width', type=int, default=1,
+                        help='ROI edge width in pixels used with --diff_edge_abs_max.')
+    parser.add_argument('--train_max_lag_frames', type=int, default=0,
+                        help='If >0, enable shift-invariant training loss by searching lag in [-N, N] frames.')
+    parser.add_argument('--train_shift_invariant_weight', type=float, default=0.0,
+                        help='Blend weight for shift-invariant objective in [0,1]. 0=disabled, 1=fully shift-invariant.')
+    parser.add_argument('--train_lag_temperature', type=float, default=1.0,
+                        help='Softmax temperature for lag weighting. Lower values make the lag distribution sharper.')
     args = parser.parse_args()
 
     # configure logging early so modules emit consistent messages
@@ -447,6 +872,16 @@ def main():
     logger.info('Using device: %s', device)
     logger.info('Training config: augment=%s, weight_decay=%.1e, loss=%s, neg_pearson_coef=%.3f',
                 use_augment, args.weight_decay, args.loss, args.neg_pearson_coef)
+    if float(args.diff_edge_abs_max) > 0.0:
+        logger.info('Edge diff suppression enabled: abs_max=%.4f, edge_width=%d',
+                    float(args.diff_edge_abs_max), int(args.diff_edge_width))
+    if int(args.train_max_lag_frames) > 0 and float(args.train_shift_invariant_weight) > 0.0:
+        logger.info(
+            'Shift-invariant loss enabled: max_lag=%d frames, weight=%.3f, temperature=%.3f',
+            int(args.train_max_lag_frames),
+            float(args.train_shift_invariant_weight),
+            float(args.train_lag_temperature),
+        )
     if args.two_stage_training:
         logger.info('Two-stage training ENABLED: stage1=%d epochs (mae_coef=%.3f), stage2 (mae_coef=%.3f)',
                     args.stage1_epochs, args.stage1_mae_coef, args.stage2_mae_coef)
@@ -664,10 +1099,36 @@ def main():
     train_pred_stds = []
     val_pred_stds = []
     metrics_csv = save_dir / 'training_metrics.csv'
+    lag_samples_csv = save_dir / 'lag_samples_every10_epochs.csv'
     # write header
     with open(metrics_csv, 'w', newline='') as _f:
         w = csv.writer(_f)
-        w.writerow(['epoch', 'train_loss', 'train_mse', 'val_mse', 'val_loss', 'train_pearson', 'val_pearson', 'train_pred_std', 'val_pred_std'])
+        w.writerow([
+            'epoch',
+            'train_loss',
+            'train_mse',
+            'val_mse',
+            'val_loss',
+            'train_pearson',
+            'val_pearson',
+            'train_pearson_lag',
+            'val_pearson_lag',
+            'train_pearson_lag_hard',
+            'val_pearson_lag_hard',
+            'train_hard_lag_mode',
+            'val_hard_lag_mode',
+            'train_soft_lag_mean',
+            'val_soft_lag_mean',
+            'train_soft_lag_median',
+            'val_soft_lag_median',
+            'train_soft_lag_100',
+            'val_soft_lag_100',
+            'train_pred_std',
+            'val_pred_std',
+        ])
+    with open(lag_samples_csv, 'w', newline='') as _f:
+        w = csv.writer(_f)
+        w.writerow(['epoch', 'train_soft_lag_100', 'val_soft_lag_100'])
 
     # Early stopping counter
     patience_counter = 0
@@ -697,10 +1158,15 @@ def main():
             epoch=epoch,
             save_dir=save_dir,
             debug_viz_every_steps=int(args.debug_viz_every_steps),
+            diff_edge_abs_max=float(args.diff_edge_abs_max),
+            diff_edge_width=int(args.diff_edge_width),
+            train_max_lag_frames=int(args.train_max_lag_frames),
+            train_shift_invariant_weight=float(args.train_shift_invariant_weight),
+            train_lag_temperature=float(args.train_lag_temperature),
             desc=f'Epoch {epoch}/{args.epochs} {stage_label} [train]',
         )
         # compute train MSE for monitoring (limited to train_eval_batches for speed)
-        train_mse, train_stats, _train_eval_loss, train_eval_pearson = eval_model(
+        train_mse, train_stats, _train_eval_loss, train_eval_pearson, train_eval_pearson_lag, train_lag_stats = eval_model(
             model,
             train_loader,
             device,
@@ -708,21 +1174,41 @@ def main():
             desc=f'Epoch {epoch}/{args.epochs} [train-eval]',
             loss_fn=loss_fn,
             neg_pearson_coef=effective_neg_pearson_coef,
+            diff_edge_abs_max=float(args.diff_edge_abs_max),
+            diff_edge_width=int(args.diff_edge_width),
+            train_max_lag_frames=int(args.train_max_lag_frames),
+            train_shift_invariant_weight=float(args.train_shift_invariant_weight),
+            train_lag_temperature=float(args.train_lag_temperature),
         )
         # compute val metrics if validation set exists
         if val_loader is not None:
-            val_mse, val_stats, val_loss, val_pearson = eval_model(
+            val_mse, val_stats, val_loss, val_pearson, val_pearson_lag, val_lag_stats = eval_model(
                 model,
                 val_loader,
                 device,
                 desc=f'Epoch {epoch}/{args.epochs} [val-eval]',
                 loss_fn=loss_fn,
                 neg_pearson_coef=effective_neg_pearson_coef,
+                diff_edge_abs_max=float(args.diff_edge_abs_max),
+                diff_edge_width=int(args.diff_edge_width),
+                train_max_lag_frames=int(args.train_max_lag_frames),
+                train_shift_invariant_weight=float(args.train_shift_invariant_weight),
+                train_lag_temperature=float(args.train_lag_temperature),
             )
         else:
             val_mse = float('nan')
             val_loss = float('nan')
             val_pearson = float('nan')
+            val_pearson_lag = float('nan')
+            val_lag_stats = {
+                'hard_pearson': float('nan'),
+                'hard_mode': 0,
+                'hard_mean': 0.0,
+                'hard_median': 0.0,
+                'mean': 0.0,
+                'median': 0.0,
+                'sample_100': [],
+            }
             val_stats = {
                 'pred_std': float('nan'),
                 'pred_mean': float('nan'),
@@ -731,10 +1217,22 @@ def main():
                 'true_std': float('nan'),
                 'true_mean': float('nan'),
             }
+        train_soft_lag_mean = float(train_lag_stats['mean'])
+        val_soft_lag_mean = float(val_lag_stats['mean'])
+        train_soft_lag_median = float(train_lag_stats['median'])
+        val_soft_lag_median = float(val_lag_stats['median'])
+        train_hard_lag_mode = int(train_lag_stats['hard_mode'])
+        val_hard_lag_mode = int(val_lag_stats['hard_mode'])
+        train_hard_pearson = float(train_lag_stats['hard_pearson'])
+        val_hard_pearson = float(val_lag_stats['hard_pearson'])
         t1 = time.time()
         if args.two_stage_training:
             logger.info(
-                'Epoch %d/%d [%s] - mae_coef=%.3f lr=%.2e train_loss=%.4f train_mse=%.4f val_mse=%.4f train_pearson=%.4f val_pearson=%.4f train_pred_std=%.4f val_pred_std=%.4f time=%.1fs',
+                'Epoch %d/%d [%s] - mae_coef=%.3f lr=%.2e train_loss=%.4f train_mse=%.4f val_mse=%.4f '
+                'train_pearson=%.4f val_pearson=%.4f train_pearson_lag=%.4f val_pearson_lag=%.4f '
+            'train_pearson_lag_hard=%.4f val_pearson_lag_hard=%.4f train_hard_lag_mode=%d val_hard_lag_mode=%d '
+                'train_soft_lag_mean=%.4f val_soft_lag_mean=%.4f train_soft_lag_median=%.4f val_soft_lag_median=%.4f '
+                'train_pred_std=%.4f val_pred_std=%.4f time=%.1fs',
                 epoch,
                 args.epochs,
                 stage_label,
@@ -745,13 +1243,27 @@ def main():
                 val_mse,
                 train_eval_pearson,
                 val_pearson,
+                train_eval_pearson_lag,
+                val_pearson_lag,
+                train_hard_pearson,
+                val_hard_pearson,
+                train_hard_lag_mode,
+                val_hard_lag_mode,
+                train_soft_lag_mean,
+                val_soft_lag_mean,
+                train_soft_lag_median,
+                val_soft_lag_median,
                 train_stats['pred_std'],
                 val_stats['pred_std'],
                 t1 - t0,
             )
         else:
             logger.info(
-                'Epoch %d/%d - lr=%.2e train_loss=%.4f train_mse=%.4f val_mse=%.4f val_loss=%.4f train_pearson=%.4f val_pearson=%.4f train_pred_std=%.4f val_pred_std=%.4f time=%.1fs',
+                'Epoch %d/%d - lr=%.2e train_loss=%.4f train_mse=%.4f val_mse=%.4f val_loss=%.4f '
+                'train_pearson=%.4f val_pearson=%.4f train_pearson_lag=%.4f val_pearson_lag=%.4f '
+                'train_pearson_lag_hard=%.4f val_pearson_lag_hard=%.4f train_hard_lag_mode=%d val_hard_lag_mode=%d '
+                'train_soft_lag_mean=%.4f val_soft_lag_mean=%.4f train_soft_lag_median=%.4f val_soft_lag_median=%.4f '
+                'train_pred_std=%.4f val_pred_std=%.4f time=%.1fs',
                 epoch,
                 args.epochs,
                 current_lr,
@@ -761,6 +1273,16 @@ def main():
                 val_loss,
                 train_eval_pearson,
                 val_pearson,
+                train_eval_pearson_lag,
+                val_pearson_lag,
+                train_hard_pearson,
+                val_hard_pearson,
+                train_hard_lag_mode,
+                val_hard_lag_mode,
+                train_soft_lag_mean,
+                val_soft_lag_mean,
+                train_soft_lag_median,
+                val_soft_lag_median,
                 train_stats['pred_std'],
                 val_stats['pred_std'],
                 t1 - t0,
@@ -778,10 +1300,14 @@ def main():
         if writer is not None:
             writer.add_scalar('train/loss', train_loss, epoch)
             writer.add_scalar('train/pred_std', train_stats['pred_std'], epoch)
+            writer.add_scalar('train/pearson_zero_lag', train_eval_pearson, epoch)
+            writer.add_scalar('train/pearson_lag_comp', train_eval_pearson_lag, epoch)
             if val_loader is not None:
                 writer.add_scalar('val/mse', val_mse, epoch)
                 writer.add_scalar('val/loss', val_loss, epoch)
                 writer.add_scalar('val/pred_std', val_stats['pred_std'], epoch)
+                writer.add_scalar('val/pearson_zero_lag', val_pearson, epoch)
+                writer.add_scalar('val/pearson_lag_comp', val_pearson_lag, epoch)
         ckpt = save_dir / f'model_epoch_{epoch}.pt'
         torch.save({'epoch': epoch, 'model_state': model.state_dict(), 'optim_state': optimizer.state_dict()}, ckpt)
         # save best model only if we have a valid validation Pearson
@@ -813,7 +1339,37 @@ def main():
         val_pred_stds.append(val_stats['pred_std'])
         with open(metrics_csv, 'a', newline='') as f:
             w = csv.writer(f)
-            w.writerow([epoch, train_loss, train_mse, val_mse, val_loss, train_eval_pearson, val_pearson, train_stats['pred_std'], val_stats['pred_std']])
+            w.writerow([
+                epoch,
+                train_loss,
+                train_mse,
+                val_mse,
+                val_loss,
+                train_eval_pearson,
+                val_pearson,
+                train_eval_pearson_lag,
+                val_pearson_lag,
+                train_hard_pearson,
+                val_hard_pearson,
+                train_hard_lag_mode,
+                val_hard_lag_mode,
+                train_soft_lag_mean,
+                val_soft_lag_mean,
+                train_soft_lag_median,
+                val_soft_lag_median,
+                json.dumps(train_lag_stats.get('sample_100', []), ensure_ascii=True),
+                json.dumps(val_lag_stats.get('sample_100', []), ensure_ascii=True),
+                train_stats['pred_std'],
+                val_stats['pred_std'],
+            ])
+        if epoch % 10 == 0:
+            with open(lag_samples_csv, 'a', newline='') as f:
+                w = csv.writer(f)
+                w.writerow([
+                    epoch,
+                    json.dumps(train_lag_stats.get('sample_100', []), ensure_ascii=True),
+                    json.dumps(val_lag_stats.get('sample_100', []), ensure_ascii=True),
+                ])
 
         # try to save simple plots for quick visualization
         try:

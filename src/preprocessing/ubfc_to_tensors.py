@@ -348,6 +348,10 @@ def main():
                         help='For face_mesh ROI: enable align_nose_axis + center_face + face_mesh_first_frame_mask together.')
     parser.add_argument('--frame_independent_face_mesh', action='store_true',
                         help='For face_mesh ROI: run per-frame independent detection/alignment (no cross-frame shared detector state).')
+    parser.add_argument('--subjects', type=str, default='',
+                        help='Optional comma-separated subject folder names to include (e.g. s1,s2,subject9).')
+    parser.add_argument('--skip_subjects', type=str, default='',
+                        help='Optional comma-separated subject folder names to skip (e.g. s9,.ipynb_checkpoints).')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose debug logs')
     args = parser.parse_args()
 
@@ -358,7 +362,16 @@ def main():
 
     src = Path(args.src)
     out = Path(args.out)
-    subjects = [p for p in src.iterdir() if p.is_dir()]
+    subjects = [p for p in src.iterdir() if p.is_dir() and not p.name.startswith('.')]
+
+    include_set = {s.strip() for s in str(args.subjects).split(',') if s.strip()}
+    if include_set:
+        subjects = [p for p in subjects if p.name in include_set]
+
+    skip_set = {s.strip() for s in str(args.skip_subjects).split(',') if s.strip()}
+    if skip_set:
+        subjects = [p for p in subjects if p.name not in skip_set]
+
     logger.info('Found %d subject folders under %s', len(subjects), src)
 
     total = 0
