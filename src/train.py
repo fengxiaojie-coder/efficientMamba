@@ -27,7 +27,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from src.datasets.ubfc_dataset import UBFCClipDataset
-from src.models.efficientphys_mamba import EfficientPhysMambaRegressor, mamba_backend_status
+from src.models.registry import build_model, list_model_arches
 
 # optional fast progress bars; fallback to no-op if tqdm not installed
 try:
@@ -845,6 +845,8 @@ def main():
                         help='How to split train/val: random by clip, or disjoint by subject')
     parser.add_argument('--temporal_backbone', type=str, default='auto', choices=['auto', 'mamba', 'gru'],
                         help='Temporal model selection: auto=prefer mamba with GRU fallback, mamba=fail if unavailable, gru=force GRU')
+    parser.add_argument('--model_arch', type=str, default='efficientphys_mamba', choices=list_model_arches(),
+                        help='Model family name from src.models.registry.MODEL_REGISTRY')
     parser.add_argument('--debug_viz_every_steps', type=int, default=0,
                         help='If >0, save quick debug visualizations every N training steps to checkpoints/debug_steps')
     parser.add_argument('--train_eval_batches', type=int, default=10,
@@ -859,6 +861,8 @@ def main():
                         help='Blend weight for shift-invariant objective in [0,1]. 0=disabled, 1=fully shift-invariant.')
     parser.add_argument('--train_lag_temperature', type=float, default=1.0,
                         help='Softmax temperature for lag weighting. Lower values make the lag distribution sharper.')
+    parser.add_argument('--benchmark_mode', action='store_true',
+                        help='Benchmark core training throughput by disabling per-epoch eval and visualizations.')
     args = parser.parse_args()
 
     # configure logging early so modules emit consistent messages
@@ -885,6 +889,8 @@ def main():
     if args.two_stage_training:
         logger.info('Two-stage training ENABLED: stage1=%d epochs (mae_coef=%.3f), stage2 (mae_coef=%.3f)',
                     args.stage1_epochs, args.stage1_mae_coef, args.stage2_mae_coef)
+    if args.benchmark_mode:
+        logger.info('Benchmark mode ENABLED: skipping per-epoch eval and visualizations for cleaner timing.')
     logger.info(
         'LR schedule: base_lr=%.1e, warmup_epochs=%d, cosine_epochs=%d, min_lr=%.1e',
         args.lr,
@@ -1037,29 +1043,29 @@ def main():
     else:
         val_loader = None
 
-    use_mamba_requested = args.temporal_backbone != 'gru'
-    model = EfficientPhysMambaRegressor(in_channels=6, frame_depth=args.frame_depth, use_mamba=use_mamba_requested)
+    model, model_info = build_model(
+        model_arch=args.model_arch,
+        frame_depth=args.frame_depth,
+        temporal_backbone=args.temporal_backbone,
+    )
     model.to(device)
 
-    mamba_available, mamba_reason = mamba_backend_status()
-    if args.temporal_backbone == 'mamba' and not model.temporal.uses_mamba:
-        raise SystemExit(
-            'Requested --temporal_backbone mamba, but Mamba backend is unavailable. '
-            f'Reason: {mamba_reason}'
-        )
-
     # Log model configuration
-    backbone_name = 'Mamba' if model.temporal.uses_mamba else 'GRU'
-    total_params = sum(p.numel() for p in model.parameters())
-    temporal_params = sum(p.numel() for p in model.temporal.parameters())
+    backbone_name = model_info['backbone_name']
+    total_params = int(model_info['total_params'])
+    temporal_params = int(model_info['temporal_params'])
+    mamba_available = bool(model_info['mamba_available'])
     logger.info('=' * 70)
     logger.info('Model Configuration')
     logger.info('=' * 70)
-    logger.info('Architecture: EfficientPhysMambaRegressor')
-    logger.info('Temporal Backbone: %s (requested=%s, mamba_available=%s)', backbone_name, args.temporal_backbone, mamba_available)
+    logger.info('Architecture: %s', model_info['display_name'])
+    if args.model_arch in ('physformer', 'efficientphys'):
+        logger.info('Temporal Backbone: %s', backbone_name)
+    else:
+        logger.info('Temporal Backbone: %s (requested=%s, mamba_available=%s)', backbone_name, args.temporal_backbone, mamba_available)
     logger.info('Frame depth: %d, Input channels: 6', args.frame_depth)
     logger.info('Total parameters: %s', f'{total_params:,}')
-    logger.info('Temporal backbone parameters: %s (%.1f%%)', f'{temporal_params:,}', 100*temporal_params/total_params)
+    logger.info('Temporal backbone parameters: %s (%.1f%%)', f'{temporal_params:,}', 100*temporal_params/total_params if total_params > 0 else 0.0)
     logger.info('Device: %s', device)
     logger.info('=' * 70)
 
@@ -1087,7 +1093,7 @@ def main():
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
-    writer = SummaryWriter(log_dir=str(save_dir / 'runs')) if SummaryWriter is not None else None
+    writer = SummaryWriter(log_dir=str(save_dir / 'runs')) if (SummaryWriter is not None and not args.benchmark_mode) else None
 
     best_val = float('-inf')
     epochs_done = []
@@ -1125,6 +1131,9 @@ def main():
             'val_soft_lag_100',
             'train_pred_std',
             'val_pred_std',
+            'train_step_time_seconds',
+            'post_train_overhead_seconds',
+            'epoch_time_seconds',
         ])
     with open(lag_samples_csv, 'w', newline='') as _f:
         w = csv.writer(_f)
@@ -1133,6 +1142,7 @@ def main():
     # Early stopping counter
     patience_counter = 0
     early_stopping_patience = int(args.early_stopping_patience) if hasattr(args, 'early_stopping_patience') else 15
+    training_start_time = time.time()
 
     for epoch in tqdm(range(1, args.epochs + 1), desc='Training', total=args.epochs, leave=True, ncols=100):
         current_lr = float(optimizer.param_groups[0]['lr'])
@@ -1165,37 +1175,28 @@ def main():
             train_lag_temperature=float(args.train_lag_temperature),
             desc=f'Epoch {epoch}/{args.epochs} {stage_label} [train]',
         )
-        # compute train MSE for monitoring (limited to train_eval_batches for speed)
-        train_mse, train_stats, _train_eval_loss, train_eval_pearson, train_eval_pearson_lag, train_lag_stats = eval_model(
-            model,
-            train_loader,
-            device,
-            max_batches=int(args.train_eval_batches),
-            desc=f'Epoch {epoch}/{args.epochs} [train-eval]',
-            loss_fn=loss_fn,
-            neg_pearson_coef=effective_neg_pearson_coef,
-            diff_edge_abs_max=float(args.diff_edge_abs_max),
-            diff_edge_width=int(args.diff_edge_width),
-            train_max_lag_frames=int(args.train_max_lag_frames),
-            train_shift_invariant_weight=float(args.train_shift_invariant_weight),
-            train_lag_temperature=float(args.train_lag_temperature),
-        )
-        # compute val metrics if validation set exists
-        if val_loader is not None:
-            val_mse, val_stats, val_loss, val_pearson, val_pearson_lag, val_lag_stats = eval_model(
-                model,
-                val_loader,
-                device,
-                desc=f'Epoch {epoch}/{args.epochs} [val-eval]',
-                loss_fn=loss_fn,
-                neg_pearson_coef=effective_neg_pearson_coef,
-                diff_edge_abs_max=float(args.diff_edge_abs_max),
-                diff_edge_width=int(args.diff_edge_width),
-                train_max_lag_frames=int(args.train_max_lag_frames),
-                train_shift_invariant_weight=float(args.train_shift_invariant_weight),
-                train_lag_temperature=float(args.train_lag_temperature),
-            )
-        else:
+        train_step_time = time.time() - t0
+        if args.benchmark_mode:
+            train_mse = float('nan')
+            train_eval_pearson = float('nan')
+            train_eval_pearson_lag = float('nan')
+            train_lag_stats = {
+                'hard_pearson': float('nan'),
+                'hard_mode': 0,
+                'hard_mean': 0.0,
+                'hard_median': 0.0,
+                'mean': 0.0,
+                'median': 0.0,
+                'sample_100': [],
+            }
+            train_stats = {
+                'pred_std': float('nan'),
+                'pred_mean': float('nan'),
+                'pred_min': float('nan'),
+                'pred_max': float('nan'),
+                'true_std': float('nan'),
+                'true_mean': float('nan'),
+            }
             val_mse = float('nan')
             val_loss = float('nan')
             val_pearson = float('nan')
@@ -1217,6 +1218,59 @@ def main():
                 'true_std': float('nan'),
                 'true_mean': float('nan'),
             }
+        else:
+            # compute train MSE for monitoring (limited to train_eval_batches for speed)
+            train_mse, train_stats, _train_eval_loss, train_eval_pearson, train_eval_pearson_lag, train_lag_stats = eval_model(
+                model,
+                train_loader,
+                device,
+                max_batches=int(args.train_eval_batches),
+                desc=f'Epoch {epoch}/{args.epochs} [train-eval]',
+                loss_fn=loss_fn,
+                neg_pearson_coef=effective_neg_pearson_coef,
+                diff_edge_abs_max=float(args.diff_edge_abs_max),
+                diff_edge_width=int(args.diff_edge_width),
+                train_max_lag_frames=int(args.train_max_lag_frames),
+                train_shift_invariant_weight=float(args.train_shift_invariant_weight),
+                train_lag_temperature=float(args.train_lag_temperature),
+            )
+            # compute val metrics if validation set exists
+            if val_loader is not None:
+                val_mse, val_stats, val_loss, val_pearson, val_pearson_lag, val_lag_stats = eval_model(
+                    model,
+                    val_loader,
+                    device,
+                    desc=f'Epoch {epoch}/{args.epochs} [val-eval]',
+                    loss_fn=loss_fn,
+                    neg_pearson_coef=effective_neg_pearson_coef,
+                    diff_edge_abs_max=float(args.diff_edge_abs_max),
+                    diff_edge_width=int(args.diff_edge_width),
+                    train_max_lag_frames=int(args.train_max_lag_frames),
+                    train_shift_invariant_weight=float(args.train_shift_invariant_weight),
+                    train_lag_temperature=float(args.train_lag_temperature),
+                )
+            else:
+                val_mse = float('nan')
+                val_loss = float('nan')
+                val_pearson = float('nan')
+                val_pearson_lag = float('nan')
+                val_lag_stats = {
+                    'hard_pearson': float('nan'),
+                    'hard_mode': 0,
+                    'hard_mean': 0.0,
+                    'hard_median': 0.0,
+                    'mean': 0.0,
+                    'median': 0.0,
+                    'sample_100': [],
+                }
+                val_stats = {
+                    'pred_std': float('nan'),
+                    'pred_mean': float('nan'),
+                    'pred_min': float('nan'),
+                    'pred_max': float('nan'),
+                    'true_std': float('nan'),
+                    'true_mean': float('nan'),
+                }
         train_soft_lag_mean = float(train_lag_stats['mean'])
         val_soft_lag_mean = float(val_lag_stats['mean'])
         train_soft_lag_median = float(train_lag_stats['median'])
@@ -1337,6 +1391,8 @@ def main():
         val_pearsons.append(val_pearson)
         train_pred_stds.append(train_stats['pred_std'])
         val_pred_stds.append(val_stats['pred_std'])
+        epoch_time = t1 - t0
+        post_train_overhead = max(0.0, epoch_time - train_step_time)
         with open(metrics_csv, 'a', newline='') as f:
             w = csv.writer(f)
             w.writerow([
@@ -1361,8 +1417,11 @@ def main():
                 json.dumps(val_lag_stats.get('sample_100', []), ensure_ascii=True),
                 train_stats['pred_std'],
                 val_stats['pred_std'],
+                train_step_time,
+                post_train_overhead,
+                epoch_time,
             ])
-        if epoch % 10 == 0:
+        if (not args.benchmark_mode) and epoch % 10 == 0:
             with open(lag_samples_csv, 'a', newline='') as f:
                 w = csv.writer(f)
                 w.writerow([
@@ -1372,125 +1431,142 @@ def main():
                 ])
 
         # try to save simple plots for quick visualization
-        try:
-            import matplotlib.pyplot as plt
-            import numpy as np
-            plt.figure(figsize=(8, 4))
-            plt.plot(epochs_done, train_losses, label='train_loss')
-            plt.xlabel('epoch')
-            plt.ylabel('MSE loss')
-            plt.title('Train loss')
-            plt.grid(True)
-            plt.tight_layout()
-            plt.savefig(save_dir / 'train_loss.png')
-            plt.close()
+        if not args.benchmark_mode:
+            try:
+                import matplotlib.pyplot as plt
+                import numpy as np
+                plt.figure(figsize=(8, 4))
+                plt.plot(epochs_done, train_losses, label='train_loss')
+                plt.xlabel('epoch')
+                plt.ylabel('MSE loss')
+                plt.title('Train loss')
+                plt.grid(True)
+                plt.tight_layout()
+                plt.savefig(save_dir / 'train_loss.png')
+                plt.close()
 
-            plt.figure(figsize=(8, 4))
-            plt.plot(epochs_done, train_maes, label='train_mse')
-            plt.plot(epochs_done, val_maes, label='val_mse')
-            plt.xlabel('epoch')
-            plt.ylabel('MSE (PPG)')
-            plt.title('PPG Waveform MSE over epochs')
-            plt.legend()
-            plt.grid(True)
-            plt.tight_layout()
-            plt.savefig(save_dir / 'mse_epochs.png')
-            plt.close()
-        except Exception:
-            logger.warning('Could not write training plots (matplotlib not available)')
+                plt.figure(figsize=(8, 4))
+                plt.plot(epochs_done, train_maes, label='train_mse')
+                plt.plot(epochs_done, val_maes, label='val_mse')
+                plt.xlabel('epoch')
+                plt.ylabel('MSE (PPG)')
+                plt.title('PPG Waveform MSE over epochs')
+                plt.legend()
+                plt.grid(True)
+                plt.tight_layout()
+                plt.savefig(save_dir / 'mse_epochs.png')
+                plt.close()
+            except Exception:
+                logger.warning('Could not write training plots (matplotlib not available)')
 
         # Visualize attention heatmaps every epoch
-        try:
-            import matplotlib.pyplot as plt
-            import matplotlib.cm as cm
-            import numpy as np
+        if not args.benchmark_mode:
+            try:
+                import matplotlib.pyplot as plt
+                import matplotlib.cm as cm
+                import numpy as np
 
-            model.eval()
-            with torch.no_grad():
-                # Randomly sample clips from different subjects for visualization
-                if val_loader is not None and len(val_ds.files) > 0:
-                    candidate_files = list(val_ds.files)
-                    random.shuffle(candidate_files)
+                model.eval()
+                with torch.no_grad():
+                    # Randomly sample clips from different subjects for visualization
+                    if val_loader is not None and len(val_ds.files) > 0:
+                        candidate_files = list(val_ds.files)
+                        random.shuffle(candidate_files)
 
-                    selected_files = []
-                    used_subjects = set()
-                    for fn in candidate_files:
-                        subj = subject_from_name(fn)
-                        if subj in used_subjects:
-                            continue
-                        selected_files.append(fn)
-                        used_subjects.add(subj)
-                        if len(selected_files) >= 4:
-                            break
+                        selected_files = []
+                        used_subjects = set()
+                        for fn in candidate_files:
+                            subj = subject_from_name(fn)
+                            if subj in used_subjects:
+                                continue
+                            selected_files.append(fn)
+                            used_subjects.add(subj)
+                            if len(selected_files) >= 4:
+                                break
 
-                    if len(selected_files) > 0:
-                        clips_list = []
-                        roi_types = []
-                        vis_subjects = []
-                        for fn in selected_files:
-                            data = torch.load(fn, weights_only=False)
-                            clips_list.append(data['clip'].float())
-                            roi_types.append(data.get('roi_type', 'full'))
-                            vis_subjects.append(subject_from_name(fn))
+                        if len(selected_files) > 0:
+                            clips_list = []
+                            roi_types = []
+                            vis_subjects = []
+                            for fn in selected_files:
+                                data = torch.load(fn, weights_only=False)
+                                clips_list.append(data['clip'].float())
+                                roi_types.append(data.get('roi_type', 'full'))
+                                vis_subjects.append(subject_from_name(fn))
 
-                        clips = torch.stack(clips_list, dim=0).to(device)
-                        roi_map = _build_roi_map(clips, roi_types, device)
+                            clips = torch.stack(clips_list, dim=0).to(device)
+                            roi_map = _build_roi_map(clips, roi_types, device)
 
-                        # Forward with attention
-                        _out, attn_dict = model(clips, roi_map=roi_map, return_attention=True)
+                            # Forward with attention
+                            _out, attn_dict = model(clips, roi_map=roi_map, return_attention=True)
 
-                        # Visualize g1 and g2
-                        g1 = attn_dict['g1']  # (B, T, 1, H1, W1)
-                        g2 = attn_dict['g2']  # (B, T, 1, H2, W2)
+                            # Visualize g1 and g2
+                            g1 = attn_dict['g1']  # (B, T, 1, H1, W1)
+                            g2 = attn_dict['g2']  # (B, T, 1, H2, W2)
 
-                        num_viz = g1.shape[0]
+                            num_viz = g1.shape[0]
 
-                        fig, axes = plt.subplots(num_viz, 4, figsize=(12, 3 * num_viz))
-                        if num_viz == 1:
-                            axes = axes.reshape(1, -1)
+                            fig, axes = plt.subplots(num_viz, 4, figsize=(12, 3 * num_viz))
+                            if num_viz == 1:
+                                axes = axes.reshape(1, -1)
 
-                        for bi in range(num_viz):
-                            # First frame, first gate
-                            ax = axes[bi, 0]
-                            hm = g1[bi, 0, 0].cpu().numpy()
-                            im = ax.imshow(hm, cmap='hot')
-                            ax.set_title(f'{vis_subjects[bi]} G1 Frame 0')
-                            ax.axis('off')
-                            plt.colorbar(im, ax=ax, fraction=0.046)
+                            for bi in range(num_viz):
+                                # First frame, first gate
+                                ax = axes[bi, 0]
+                                hm = g1[bi, 0, 0].cpu().numpy()
+                                im = ax.imshow(hm, cmap='hot')
+                                ax.set_title(f'{vis_subjects[bi]} G1 Frame 0')
+                                ax.axis('off')
+                                plt.colorbar(im, ax=ax, fraction=0.046)
 
-                            # Middle frame, first gate
-                            ax = axes[bi, 1]
-                            mid_t = g1.shape[1] // 2
-                            hm = g1[bi, mid_t, 0].cpu().numpy()
-                            im = ax.imshow(hm, cmap='hot')
-                            ax.set_title(f'{vis_subjects[bi]} G1 Frame {mid_t}')
-                            ax.axis('off')
-                            plt.colorbar(im, ax=ax, fraction=0.046)
+                                # Middle frame, first gate
+                                ax = axes[bi, 1]
+                                mid_t = g1.shape[1] // 2
+                                hm = g1[bi, mid_t, 0].cpu().numpy()
+                                im = ax.imshow(hm, cmap='hot')
+                                ax.set_title(f'{vis_subjects[bi]} G1 Frame {mid_t}')
+                                ax.axis('off')
+                                plt.colorbar(im, ax=ax, fraction=0.046)
 
-                            # First frame, second gate
-                            ax = axes[bi, 2]
-                            hm = g2[bi, 0, 0].cpu().numpy()
-                            im = ax.imshow(hm, cmap='hot')
-                            ax.set_title(f'{vis_subjects[bi]} G2 Frame 0')
-                            ax.axis('off')
-                            plt.colorbar(im, ax=ax, fraction=0.046)
+                                # First frame, second gate
+                                ax = axes[bi, 2]
+                                hm = g2[bi, 0, 0].cpu().numpy()
+                                im = ax.imshow(hm, cmap='hot')
+                                ax.set_title(f'{vis_subjects[bi]} G2 Frame 0')
+                                ax.axis('off')
+                                plt.colorbar(im, ax=ax, fraction=0.046)
 
-                            # Middle frame, second gate
-                            ax = axes[bi, 3]
-                            mid_t = g2.shape[1] // 2
-                            hm = g2[bi, mid_t, 0].cpu().numpy()
-                            im = ax.imshow(hm, cmap='hot')
-                            ax.set_title(f'{vis_subjects[bi]} G2 Frame {mid_t}')
-                            ax.axis('off')
-                            plt.colorbar(im, ax=ax, fraction=0.046)
+                                # Middle frame, second gate
+                                ax = axes[bi, 3]
+                                mid_t = g2.shape[1] // 2
+                                hm = g2[bi, mid_t, 0].cpu().numpy()
+                                im = ax.imshow(hm, cmap='hot')
+                                ax.set_title(f'{vis_subjects[bi]} G2 Frame {mid_t}')
+                                ax.axis('off')
+                                plt.colorbar(im, ax=ax, fraction=0.046)
 
                         plt.suptitle(f'Epoch {epoch} - Attention Heatmaps (different subjects)', fontsize=14)
                         plt.tight_layout()
                         plt.savefig(save_dir / f'attention_epoch_{epoch:03d}.png', dpi=80)
                         plt.close()
                         logger.info(f'Saved attention heatmap visualization to {save_dir / f"attention_epoch_{epoch:03d}.png"}')
-        except Exception as e:
-            logger.warning(f'Could not save attention heatmaps: {e}')
+            except Exception as e:
+                logger.warning(f'Could not save attention heatmaps: {e}')
+
+    # Record total training time
+    training_end_time = time.time()
+    total_training_time = training_end_time - training_start_time
+    logger.info('=' * 70)
+    logger.info('Training Summary')
+    logger.info('=' * 70)
+    logger.info('Total training time: %.1f seconds (%.2f hours)', total_training_time, total_training_time / 3600)
+    logger.info('Avg time per epoch: %.1f seconds', total_training_time / len(epochs_done) if len(epochs_done) > 0 else 0)
+    logger.info('Best validation Pearson: %.4f', best_val)
+
+    # Append total time to metrics CSV
+    with open(metrics_csv, 'a', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['TOTAL_TRAINING_TIME_SECONDS', total_training_time])
 
 
 if __name__ == '__main__':

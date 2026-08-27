@@ -9,11 +9,11 @@ scikit-learn
 transformers
 tiktoken
 huggingface_hub
-opencv-python-headless
+opencv-python-headless==4.13.0.92
 matplotlib
 seaborn
 sentencepiece
-protobuf==3.20.3
+protobuf
 tensorboard
 mediapipe==0.10.21
 # Cloud/GPU note:

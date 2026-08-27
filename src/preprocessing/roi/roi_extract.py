@@ -6,9 +6,14 @@ from typing import Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
+from src.preprocessing.registry import build_roi_strategy
+
 logger = logging.getLogger(__name__)
 
 BBox = Tuple[int, int, int, int]
+
+# ROI strategy implementations now live in dedicated modules under
+# src/preprocessing/roi_strategies/ and are registered from roi_registry.py.
 
 # Alignment safeguards: avoid over-correcting near-frontal faces.
 MAX_ROLL_CORRECTION_DEG = 20.0
@@ -194,6 +199,86 @@ def _apply_ellipse_mask(frame: np.ndarray, bbox: Optional[BBox]) -> np.ndarray:
     axes = (max(1, (x2 - x1) // 2), max(1, (y2 - y1) // 2))
     cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
     return cv2.bitwise_and(frame, frame, mask=mask)
+
+
+def resize_full_frame(frame: np.ndarray, size: int = 72) -> np.ndarray:
+    return _resize_frame(_ensure_rgb(frame), size)
+
+
+def crop_bbox_region(frame: np.ndarray, bbox: Optional[BBox], size: int = 72) -> np.ndarray:
+    frame = _ensure_rgb(frame)
+    height, width = frame.shape[:2]
+    y_slice, x_slice = _bbox_to_slices(bbox, height, width)
+    return _resize_frame(frame[y_slice, x_slice], size)
+
+
+def crop_ellipse_region(frame: np.ndarray, bbox: Optional[BBox], size: int = 72) -> np.ndarray:
+    frame = _ensure_rgb(frame)
+    if bbox is None:
+        return _resize_frame(frame, size)
+    height, width = frame.shape[:2]
+    y_slice, x_slice = _bbox_to_slices(bbox, height, width)
+    roi_frame = frame[y_slice, x_slice]
+    local_bbox = (0, 0, roi_frame.shape[1], roi_frame.shape[0])
+    return _resize_frame(_apply_ellipse_mask(roi_frame, local_bbox), size)
+
+
+def crop_polygon_region(
+    frame: np.ndarray,
+    polygon: Optional[np.ndarray],
+    bbox: Optional[BBox],
+    size: int = 72,
+) -> np.ndarray:
+    frame = _ensure_rgb(frame)
+    height, width = frame.shape[:2]
+    if polygon is None:
+        y_slice, x_slice = _bbox_to_slices(bbox, height, width)
+        return _resize_frame(frame[y_slice, x_slice], size)
+
+    poly = np.asarray(polygon, dtype=np.int32)
+    x1 = int(np.clip(np.min(poly[:, 0]), 0, width - 1))
+    x2 = int(np.clip(np.max(poly[:, 0]) + 1, 1, width))
+    y1 = int(np.clip(np.min(poly[:, 1]), 0, height - 1))
+    y2 = int(np.clip(np.max(poly[:, 1]) + 1, 1, height))
+    if x2 <= x1 or y2 <= y1:
+        y_slice, x_slice = _bbox_to_slices(bbox, height, width)
+        return _resize_frame(frame[y_slice, x_slice], size)
+
+    crop = frame[y1:y2, x1:x2]
+    local = poly.copy()
+    local[:, 0] -= x1
+    local[:, 1] -= y1
+    mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(mask, [local], 255)
+    roi_frame = cv2.bitwise_and(crop, crop, mask=mask)
+    return _resize_frame(roi_frame, size)
+
+
+def detect_compact_face_bbox(
+    frames: Sequence[np.ndarray],
+    pad: float = 0.0,
+    forehead_ratio: float = 0.20,
+    side_ratio: float = 0.20,
+    bottom_ratio: float = 0.20,
+    max_frames: int = 30,
+) -> BBox:
+    base_bbox = detect_face_bbox_mediapipe(frames, pad=pad, max_frames=max_frames) or detect_face_bbox_haar(
+        frames,
+        pad=pad,
+        forehead_ratio=0.0,
+        side_ratio=0.0,
+        bottom_ratio=0.0,
+        max_frames=max_frames,
+    ) or _default_face_bbox(frames[0])
+    h, w = frames[0].shape[:2]
+    return _expand_bbox_directional(
+        base_bbox,
+        forehead_ratio=forehead_ratio,
+        side_ratio=side_ratio,
+        bottom_ratio=bottom_ratio,
+        width=w,
+        height=h,
+    )
 
 
 def detect_face_polygon_mediapipe(
@@ -560,51 +645,20 @@ def apply_roi_and_resize(
     height, width = frame.shape[:2]
 
     if roi == "full":
-        roi_frame = frame
+        return resize_full_frame(frame, size=size)
     elif roi == "ellipse":
-        if bbox is None:
-            roi_frame = frame
-        else:
-            y_slice, x_slice = _bbox_to_slices(bbox, height, width)
-            roi_frame = frame[y_slice, x_slice]
-            local_bbox = (0, 0, roi_frame.shape[1], roi_frame.shape[0])
-            roi_frame = _apply_ellipse_mask(roi_frame, local_bbox)
+        return crop_ellipse_region(frame, bbox=bbox, size=size)
     elif roi == "bbox":
-        # Keep a compact face crop only; no internal mask is drawn for this mode.
-        y_slice, x_slice = _bbox_to_slices(bbox, height, width)
-        roi_frame = frame[y_slice, x_slice]
+        return crop_bbox_region(frame, bbox=bbox, size=size)
     elif roi == "face_mesh":
         poly = None
         if isinstance(features, dict):
             poly = features.get('face_polygon')
-        if poly is None:
-            # Fallback to bbox crop when landmarks are unavailable.
-            y_slice, x_slice = _bbox_to_slices(bbox, height, width)
-            roi_frame = frame[y_slice, x_slice]
-        else:
-            poly = np.asarray(poly, dtype=np.int32)
-            x1 = int(np.clip(np.min(poly[:, 0]), 0, width - 1))
-            x2 = int(np.clip(np.max(poly[:, 0]) + 1, 1, width))
-            y1 = int(np.clip(np.min(poly[:, 1]), 0, height - 1))
-            y2 = int(np.clip(np.max(poly[:, 1]) + 1, 1, height))
-            if x2 <= x1 or y2 <= y1:
-                y_slice, x_slice = _bbox_to_slices(bbox, height, width)
-                roi_frame = frame[y_slice, x_slice]
-            else:
-                crop = frame[y1:y2, x1:x2]
-                local = poly.copy()
-                local[:, 0] -= x1
-                local[:, 1] -= y1
-                mask = np.zeros(crop.shape[:2], dtype=np.uint8)
-                cv2.fillPoly(mask, [local], 255)
-                roi_frame = cv2.bitwise_and(crop, crop, mask=mask)
+        return crop_polygon_region(frame, polygon=poly, bbox=bbox, size=size)
     elif roi in {"haar", "mediapipe"}:
-        y_slice, x_slice = _bbox_to_slices(bbox, height, width)
-        roi_frame = frame[y_slice, x_slice]
+        return crop_bbox_region(frame, bbox=bbox, size=size)
     else:
         raise ValueError(f"Unsupported ROI strategy: {roi}")
-
-    return _resize_frame(roi_frame, size)
 
 
 def extract_roi(frame: np.ndarray, roi: str = "bbox", size: int = 72, bbox: Optional[BBox] = None) -> np.ndarray:
@@ -632,41 +686,22 @@ def detect_face_bbox(
     if roi == "mediapipe":
         return detect_face_bbox_mediapipe(frames, pad=pad, max_frames=max_frames)
     if roi in {"bbox", "face_mesh"}:
-        base_bbox = detect_face_bbox_mediapipe(frames, pad=pad, max_frames=max_frames) or detect_face_bbox_haar(
+        return detect_compact_face_bbox(
             frames,
             pad=pad,
-            forehead_ratio=0.0,
-            side_ratio=0.0,
-            bottom_ratio=0.0,
-            max_frames=max_frames,
-        ) or _default_face_bbox(frames[0])
-        h, w = frames[0].shape[:2]
-        return _expand_bbox_directional(
-            base_bbox,
             forehead_ratio=forehead_ratio,
             side_ratio=side_ratio,
             bottom_ratio=bottom_ratio,
-            width=w,
-            height=h,
+            max_frames=max_frames,
         )
     if roi == "ellipse":
-        # Ellipse masking still needs a face bbox; reuse bbox detection pipeline.
-        base_bbox = detect_face_bbox_mediapipe(frames, pad=pad, max_frames=max_frames) or detect_face_bbox_haar(
+        return detect_compact_face_bbox(
             frames,
             pad=pad,
-            forehead_ratio=0.0,
-            side_ratio=0.0,
-            bottom_ratio=0.0,
-            max_frames=max_frames,
-        ) or _default_face_bbox(frames[0])
-        h, w = frames[0].shape[:2]
-        return _expand_bbox_directional(
-            base_bbox,
             forehead_ratio=forehead_ratio,
             side_ratio=side_ratio,
             bottom_ratio=bottom_ratio,
-            width=w,
-            height=h,
+            max_frames=max_frames,
         )
     return None
 
@@ -688,185 +723,20 @@ def transform_frames_with_roi(
     if frames.ndim != 4 or frames.shape[-1] != 3:
         raise ValueError(f"Expected frames with shape [N, H, W, 3], got {frames.shape}")
 
-    if canonical_face_mask:
-        align_nose_axis = True
-        center_face = True
-
-    bbox = detect_face_bbox(
+    strategy = build_roi_strategy(roi)
+    return strategy.transform(
         frames,
-        roi=roi,
+        size=size,
         pad=pad,
         forehead_ratio=forehead_ratio,
         side_ratio=side_ratio,
         bottom_ratio=bottom_ratio,
+        align_nose_axis=align_nose_axis,
+        face_mesh_first_frame_mask=face_mesh_first_frame_mask,
+        center_face=center_face,
+        canonical_face_mask=canonical_face_mask,
+        frame_independent_face_mesh=frame_independent_face_mesh,
     )
-    processed: list[np.ndarray] = []
-    if roi == 'face_mesh':
-        h, w = frames[0].shape[:2]
-        canvas_center = (w / 2.0, h / 2.0)
-        if face_mesh_first_frame_mask:
-            static_poly = detect_face_polygon_mediapipe(
-                [frames[0]],
-                max_frames=1,
-                forehead_ratio=forehead_ratio,
-                side_ratio=side_ratio,
-                bottom_ratio=bottom_ratio,
-            )
-            static_center: Optional[tuple[float, float]] = None
-            static_angle: Optional[float] = None
-            static_scale: Optional[float] = None
-            frame_centers: list[Optional[tuple[float, float]]] = [None for _ in frames]
-            frame_angles: list[Optional[float]] = [None for _ in frames]
-            frame_scales: list[Optional[float]] = [None for _ in frames]
-            if align_nose_axis:
-                # frame_independent_face_mesh uses static_image_mode=True which already
-                # treats every frame independently (no tracking state).  A single FaceMesh
-                # instance is reused to avoid per-frame GPU context initialisation.
-                _polys_all, centers_all, angles_all, scales_all = detect_face_polygons_mediapipe(
-                    frames,
-                    forehead_ratio=forehead_ratio,
-                    side_ratio=side_ratio,
-                    bottom_ratio=bottom_ratio,
-                    smoothing_alpha=1.0,
-                    static_image_mode=frame_independent_face_mesh,
-                    fallback_to_previous=not frame_independent_face_mesh,
-                    return_alignment=True,
-                    return_scale=True,
-                )
-                frame_centers = centers_all
-                frame_angles = angles_all
-                frame_scales = scales_all
-                if centers_all:
-                    static_center = centers_all[0]
-                if angles_all:
-                    static_angle = angles_all[0]
-                if scales_all:
-                    static_scale = scales_all[0]
-
-            if static_poly is not None:
-                # Build fixed mask in canonical coordinates using first-frame registration.
-                canonical_poly = static_poly
-                _dummy = frames[0]
-                if align_nose_axis and static_center is not None and static_angle is not None and abs(float(static_angle)) > 1e-4:
-                    _dummy, canonical_poly = _rotate_frame_and_polygon(_dummy, canonical_poly, static_center, static_angle)
-                if center_face:
-                    base_center = static_center if static_center is not None else (
-                        float(np.mean(canonical_poly[:, 0])), float(np.mean(canonical_poly[:, 1]))
-                    )
-                    _dummy, canonical_poly = _translate_frame_and_polygon(_dummy, canonical_poly, base_center, canvas_center)
-
-                bbox = _poly_to_bbox(canonical_poly, w, h)
-                last_valid_center = static_center
-                last_valid_angle = static_angle
-                last_valid_scale = static_scale
-                for i, frame in enumerate(frames):
-                    curr_frame = frame
-                    curr_poly = canonical_poly
-                    curr_center = frame_centers[i] if i < len(frame_centers) else None
-                    curr_angle = frame_angles[i] if i < len(frame_angles) else None
-                    curr_scale = frame_scales[i] if i < len(frame_scales) else None
-
-                    # If a frame misses landmarks, keep geometric registration stable by
-                    # reusing the latest valid alignment parameters.
-                    if curr_center is None:
-                        curr_center = last_valid_center
-                    else:
-                        last_valid_center = curr_center
-                    if curr_angle is None:
-                        curr_angle = last_valid_angle
-                    else:
-                        last_valid_angle = curr_angle
-                    if curr_scale is None:
-                        curr_scale = last_valid_scale
-                    else:
-                        last_valid_scale = curr_scale
-
-                    if align_nose_axis and curr_center is not None and curr_angle is not None and abs(float(curr_angle)) > 1e-4:
-                        curr_frame, _tmp_poly = _rotate_frame_and_polygon(curr_frame, static_poly, curr_center, curr_angle)
-
-                    # Optional scale normalization to first-frame eye distance.
-                    if align_nose_axis and static_scale is not None and curr_scale is not None and curr_center is not None and curr_scale > 1e-6:
-                        sf = float(np.clip(static_scale / curr_scale, 1.0 / MAX_SCALE_CORRECTION, MAX_SCALE_CORRECTION))
-                        if abs(sf - 1.0) > 1e-4:
-                            curr_frame, _tmp_poly = _scale_frame_and_polygon(curr_frame, static_poly, curr_center, sf)
-
-                    if center_face:
-                        if curr_center is not None:
-                            curr_frame, _tmp_poly = _translate_frame_and_polygon(curr_frame, static_poly, curr_center, canvas_center)
-                    processed.append(
-                        apply_roi_and_resize(
-                            curr_frame,
-                            roi=roi,
-                            size=size,
-                            bbox=_poly_to_bbox(curr_poly, w, h),
-                            features={'face_polygon': curr_poly},
-                        )
-                    )
-                return np.stack(processed, axis=0), bbox
-
-        if align_nose_axis:
-            frame_polys, align_centers, align_angles = detect_face_polygons_mediapipe(
-                frames,
-                forehead_ratio=forehead_ratio,
-                side_ratio=side_ratio,
-                bottom_ratio=bottom_ratio,
-                static_image_mode=frame_independent_face_mesh,
-                fallback_to_previous=not frame_independent_face_mesh,
-                return_alignment=True,
-            )
-        else:
-            frame_polys = detect_face_polygons_mediapipe(
-                frames,
-                forehead_ratio=forehead_ratio,
-                side_ratio=side_ratio,
-                bottom_ratio=bottom_ratio,
-                static_image_mode=frame_independent_face_mesh,
-                fallback_to_previous=not frame_independent_face_mesh,
-            )
-            align_centers = [None for _ in frames]
-            align_angles = [None for _ in frames]
-        frame_bboxes: list[BBox] = []
-        last_poly: Optional[np.ndarray] = None
-        last_center: Optional[tuple[float, float]] = None
-        last_angle: Optional[float] = None
-        for i, frame in enumerate(frames):
-            poly = frame_polys[i] if i < len(frame_polys) else None
-            center = align_centers[i] if i < len(align_centers) else None
-            angle = align_angles[i] if i < len(align_angles) else None
-            if poly is None:
-                poly = last_poly
-                center = last_center
-                angle = last_angle
-            if poly is not None:
-                last_poly = poly
-                if center is not None:
-                    last_center = center
-                if angle is not None:
-                    last_angle = angle
-                curr_frame = frame
-                if align_nose_axis and center is not None and angle is not None and abs(float(angle)) > 1e-4:
-                    curr_frame, poly = _rotate_frame_and_polygon(frame, poly, center, angle)
-                if center_face:
-                    align_center = center if center is not None else (
-                        float(np.mean(poly[:, 0])), float(np.mean(poly[:, 1]))
-                    )
-                    curr_frame, poly = _translate_frame_and_polygon(curr_frame, poly, align_center, canvas_center)
-                curr_bbox = _poly_to_bbox(poly, w, h)
-                frame_bboxes.append(curr_bbox)
-                curr_features = {'face_polygon': poly}
-            else:
-                curr_frame = frame
-                curr_bbox = bbox
-                curr_features = None
-            processed.append(apply_roi_and_resize(curr_frame, roi=roi, size=size, bbox=curr_bbox, features=curr_features))
-        if frame_bboxes:
-            bbox = _median_bbox(frame_bboxes)
-    else:
-        processed = [
-            apply_roi_and_resize(frame, roi=roi, size=size, bbox=bbox, features=None)
-            for frame in frames
-        ]
-    return np.stack(processed, axis=0), bbox
 
 
 def get_face_bbox(*args, **kwargs):
@@ -884,12 +754,17 @@ def crop_and_resize_roi(*args, **kwargs):
 __all__ = [
     "BBox",
     "apply_roi_and_resize",
+    "crop_bbox_region",
+    "crop_ellipse_region",
+    "crop_polygon_region",
     "crop_and_resize_roi",
+    "detect_compact_face_bbox",
     "detect_face_bbox",
     "detect_face_bbox_haar",
     "detect_face_bbox_mediapipe",
     "extract_roi",
     "get_face_bbox",
+    "resize_full_frame",
     "roi_extract",
     "transform_frames_with_roi",
 ]

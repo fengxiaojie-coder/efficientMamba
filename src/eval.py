@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import time
+import csv
 
 import torch
 from torch.utils.data import DataLoader
@@ -16,12 +18,14 @@ import logging
 logger = logging.getLogger(__name__)
 
 from src.datasets.ubfc_dataset import UBFCClipDataset
-from src.models.efficientphys_mamba import EfficientPhysMambaRegressor
+from src.models.registry import build_model, list_model_arches
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--clips_dir', default='data/ubfc_clips')
+    parser.add_argument('--out_dir', default='',
+                        help='Optional explicit evaluation output directory. If empty, uses eval_outputs/<model_arch>/<dataset_name>.')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose (DEBUG) logging')
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--batch_size', type=int, default=8)
@@ -44,6 +48,10 @@ def main():
                         help='How to select/aggregate clips: random by clip, or grouped by subject')
     parser.add_argument('--dataset_name', type=str, default='auto', choices=['auto', 'ubfc', 'ubfc_phys'],
                         help='Dataset tag used for eval output folders and filenames')
+    parser.add_argument('--model_arch', type=str, default='efficientphys_mamba', choices=list_model_arches(),
+                        help='Model family name from src.models.registry.MODEL_REGISTRY')
+    parser.add_argument('--temporal_backbone', type=str, default='auto', choices=['auto', 'mamba', 'gru'],
+                        help='Used for models that support temporal backend variants (e.g., efficientphys_mamba).')
     parser.add_argument('--ppg_max_lag_frames', type=int, default=0,
                         help='If >0, search lag in [-N, N] frames for lag-compensated waveform metrics.')
     parser.add_argument('--subject_ppg_clips_per_figure', type=int, default=10,
@@ -101,24 +109,28 @@ def main():
 
     ds.files = filtered_files
 
-    model = EfficientPhysMambaRegressor(in_channels=6, frame_depth=args.frame_depth)
+    model, model_info = build_model(
+        model_arch=args.model_arch,
+        frame_depth=args.frame_depth,
+        temporal_backbone=args.temporal_backbone,
+    )
     ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     model.load_state_dict(ckpt['model_state'])
     model.to(device)
     model.eval()
 
     # Log model configuration
-    backbone_name = 'Mamba' if model.temporal.uses_mamba else 'GRU'
-    total_params = sum(p.numel() for p in model.parameters())
-    temporal_params = sum(p.numel() for p in model.temporal.parameters())
+    backbone_name = model_info['backbone_name']
+    total_params = int(model_info['total_params'])
+    temporal_params = int(model_info['temporal_params'])
     logger.info('=' * 70)
     logger.info('Model Configuration')
     logger.info('=' * 70)
-    logger.info('Architecture: EfficientPhysMambaRegressor')
+    logger.info('Architecture: %s', model_info['display_name'])
     logger.info('Temporal Backbone: %s', backbone_name)
     logger.info('Frame depth: %d, Input channels: 6', args.frame_depth)
     logger.info('Total parameters: %s', f'{total_params:,}')
-    logger.info('Temporal backbone parameters: %s (%.1f%%)', f'{temporal_params:,}', 100*temporal_params/total_params)
+    logger.info('Temporal backbone parameters: %s (%.1f%%)', f'{temporal_params:,}', 100*temporal_params/total_params if total_params > 0 else 0.0)
     logger.info('Device: %s', device)
     logger.info('Checkpoint: %s', args.checkpoint)
     logger.info('Dataset tag: %s', dataset_name)
@@ -319,6 +331,9 @@ def main():
     ppg_nrmse_lag = []
     ppg_best_lags = []
 
+    # Record evaluation timing
+    eval_start_time = time.time()
+
     # Manual batching so we can access filenames / per-file fps
     total = len(ds.files)
     max_samples = int(args.max_samples) if args.max_samples and args.max_samples > 0 else total
@@ -369,17 +384,21 @@ def main():
             except Exception:
                 roi_map = None
 
-            # forward: get per-frame waveform by applying head to temporal features
-            features = model.forward_features(clips_device, roi_map=roi_map)
-            temporal = model.temporal(features)
-            per_frame = model.head(temporal).squeeze(-1).cpu().numpy()  # [B,T]
-            pooled_out = model(clips_device, roi_map=roi_map).cpu().numpy().ravel()
+            # Forward via unified model API and normalize to [B, T] waveform output.
+            pred_out = model(clips_device, roi_map=roi_map)
+            if pred_out.dim() == 3 and pred_out.size(-1) == 1:
+                per_frame = pred_out.squeeze(-1).cpu().numpy()  # [B, T]
+            elif pred_out.dim() == 2:
+                per_frame = pred_out.cpu().numpy()  # [B, T]
+            else:
+                raise RuntimeError(f'Unexpected model output shape for waveform prediction: {tuple(pred_out.shape)}')
 
             # collect
             for j, fn in enumerate(batch_files):
                 subject_name = extract_subject_name(fn.name)
                 payload = batch_payloads[j]
-                preds.append(float(pooled_out[j]))
+                # Use peak-based HR from predicted waveform as the model HR estimate.
+                # This keeps HR metrics in bpm and avoids shape-dependent scalar misuse.
                 hrs.append(float(batch_hrs[j]))
                 fns.append(fn.name)
                 # FFT-based HR estimate from per-frame waveform
@@ -387,6 +406,8 @@ def main():
                 sig = per_frame[j]
                 fft_hr = estimate_hr_from_waveform(sig, fps=fps_val)
                 pred_peak_hr = estimate_hr_from_peaks(sig, fps=fps_val)
+                pred_hr = pred_peak_hr
+                preds.append(float(pred_hr) if not np.isnan(pred_hr) else float('nan'))
                 true_ppg = payload.get('ppg')
                 if true_ppg is not None:
                     _pred_aligned, true_aligned = _align_true_ppg_to_pred(sig, np.asarray(true_ppg))
@@ -406,7 +427,7 @@ def main():
                     'signal': np.asarray(sig).copy(),
                     'true_ppg': np.asarray(payload.get('ppg')).copy() if payload.get('ppg') is not None else None,
                     'fps': fps_val,
-                    'pred_hr': float(pooled_out[j]),
+                    'pred_hr': float(pred_hr) if not np.isnan(pred_hr) else float('nan'),
                     'fft_hr': float(fft_hr) if not np.isnan(fft_hr) else float('nan'),
                     'fft_true_hr': float(true_fft_hr) if not np.isnan(true_fft_hr) else float('nan'),
                     'peak_hr': float(pred_peak_hr) if not np.isnan(pred_peak_hr) else float('nan'),
@@ -466,6 +487,10 @@ def main():
     logger.info('Std Peak: %.3f', peak_metrics['std_pred'])
     logger.info('----------------------------')
 
+    # Record evaluation end time
+    eval_end_time = time.time()
+    eval_total_time = eval_end_time - eval_start_time
+
     valid_corr = np.array([x for x in ppg_corrs if not np.isnan(x)], dtype=float)
     valid_nrmse = np.array([x for x in ppg_nrmse if not np.isnan(x)], dtype=float)
     valid_corr_lag = np.array([x for x in ppg_corrs_lag if not np.isnan(x)], dtype=float)
@@ -491,11 +516,39 @@ def main():
     else:
         logger.warning('No ground-truth PPG found in clip payloads, skipping waveform metrics.')
 
-    # Save CSV and plots
-    out_dir = Path('eval_outputs') / dataset_name
+    # Log evaluation timing summary
+    logger.info('=' * 70)
+    logger.info('Evaluation Summary')
+    logger.info('=' * 70)
+    logger.info('Total evaluation time: %.1f seconds (%.2f minutes)', eval_total_time, eval_total_time / 60)
+    logger.info('Clips evaluated: %d', len(records))
+    logger.info('Avg time per clip: %.3f seconds', eval_total_time / max(1, len(records)))
+    logger.info('Throughput: %.2f clips/second', len(records) / max(1, eval_total_time))
+    logger.info('=' * 70)
+
+    # Save CSV and plots under model-specific folders to avoid cross-model overwrite.
+    out_dir = Path(args.out_dir) if args.out_dir else Path('eval_outputs') / args.model_arch / dataset_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    import csv
     csv_path = out_dir / f'predictions_{dataset_name}.csv'
+    logger.info('Saving evaluation artifacts to: %s', out_dir)
+
+    # Save evaluation metrics CSV with timing information
+    eval_metrics_path = out_dir / f'eval_metrics_{dataset_name}.csv'
+    with open(eval_metrics_path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['metric', 'value'])
+        w.writerow(['total_eval_time_seconds', eval_total_time])
+        w.writerow(['clips_evaluated', len(records)])
+        w.writerow(['avg_time_per_clip_seconds', eval_total_time / max(1, len(records))])
+        w.writerow(['throughput_clips_per_second', len(records) / max(1, eval_total_time)])
+        w.writerow(['fft_pearson', fft_metrics['pearson_abs']])
+        w.writerow(['peak_pearson', peak_metrics['pearson_abs']])
+        w.writerow(['fft_mae_bpm', fft_metrics['mae']])
+        w.writerow(['peak_mae_bpm', peak_metrics['mae']])
+        if valid_corr.size > 0:
+            w.writerow(['ppg_mean_pearson', float(np.mean(valid_corr))])
+            w.writerow(['ppg_median_pearson', float(np.median(valid_corr))])
+
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['file', 'pred_hr', 'fft_hr', 'fft_true_hr', 'peak_hr', 'peak_true_hr', 'true_hr'])
@@ -1021,9 +1074,15 @@ def main():
                 g = torch.exp(-dist2 / (0.5 ** 2))
                 roi_map_single = torch.tensor(g, device=device).unsqueeze(0).unsqueeze(0)
             with torch.no_grad():
-                feat = model.forward_features(clip, roi_map=roi_map_single)
-                temp = model.temporal(feat)
-                sig = model.head(temp).squeeze(-1).cpu().numpy()[0]
+                pred_single = model(clip, roi_map=roi_map_single)
+                if pred_single.dim() == 3 and pred_single.size(-1) == 1:
+                    sig = pred_single.squeeze(-1).cpu().numpy()[0]
+                elif pred_single.dim() == 2:
+                    sig = pred_single.cpu().numpy()[0]
+                else:
+                    raise RuntimeError(
+                        f'Unexpected model output shape for waveform prediction: {tuple(pred_single.shape)}'
+                    )
             fps_val = float(data.get('fps', args.fps))
             title = (
                 f"{ds.files[k].name} | true={data.get('hr', 0):.1f} bpm | "
